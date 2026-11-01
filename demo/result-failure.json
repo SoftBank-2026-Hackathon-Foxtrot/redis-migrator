@@ -1,0 +1,136 @@
+{
+  "mode": "failure",
+  "failure_times": {
+    "kill_start": 1793542655.795011,
+    "killed": 1793542656.4747498,
+    "rollback_done": 1793542656.8995886
+  },
+  "failure": {
+    "rollback_call_ms": 425,
+    "paused_ms": 314.196,
+    "reverse_backlog_at_failure": 0,
+    "sessions_lost": 0,
+    "failed_requests_kill_to_rollback": 13,
+    "failed_requests_after_rollback": 0,
+    "cache_ok_after_rollback": true,
+    "app_write_on_aws": "write allowed"
+  },
+  "failure_log": [
+    [
+      1793542655.774,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.493,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.498,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.648,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.503,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.5,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542655.771,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.478,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542655.768,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.653,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.657,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.48,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.506,
+      "price 500"
+    ],
+    [
+      1793542656.596,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.495,
+      "500 Internal Server Error"
+    ],
+    [
+      1793542656.66,
+      "500 Internal Server Error"
+    ]
+  ],
+  "load": {
+    "requests": 1364,
+    "failed": 16,
+    "p50_ms": 62.0,
+    "p99_ms": 781.0,
+    "max_ms": 4391.0
+  },
+  "failed": 16,
+  "session_lost": 0,
+  "invariants": {
+    "ok": true,
+    "violations": [],
+    "statuses": {
+      "CONFIRMED": 406
+    },
+    "stats": {
+      "worker_redis_errors": 4
+    },
+    "notifications": {
+      "confirmed": 406
+    }
+  },
+  "order": {
+    "cutover 1": {
+      "pre": 195,
+      "post": 211,
+      "last_pre_ms": 1793542650527,
+      "first_post_ms": 1793542651034,
+      "ok": true
+    }
+  },
+  "checks": [
+    {
+      "label": "cutover 1",
+      "fence_ok": true,
+      "deletes_ok": true,
+      "cache_ok": true,
+      "window": [
+        1793542650.622371,
+        1793542650.65989
+      ],
+      "paused_ms": 34.514,
+      "latency_around_pause": {
+        "requests": 70,
+        "failed": 0,
+        "p50_ms": 47.0,
+        "p99_ms": 156.0,
+        "max_ms": 156.0
+      }
+    }
+  ],
+  "pass_": true
+}

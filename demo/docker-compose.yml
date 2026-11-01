@@ -1,0 +1,91 @@
+# Local stand-in for the verification scenario: ElastiCache (aws) → Memorystore (gcp),
+# both Valkey 8. Each Redis has two ACL users: default (migration/admin) and app
+# (what the proxy uses; fenced on the old side after a cutover).
+x-valkey: &valkey
+  image: valkey/valkey:8
+  command: ["valkey-server", "--requirepass", "adminpw", "--user", "app", "on", ">apppw", "~*", "&*", "+@all"]
+
+x-admin-eps: &admin_eps aws=redis://default:adminpw@redis-aws:6379,gcp=redis://default:adminpw@redis-gcp:6379
+x-admin-token: &admin_token demo-admin-token
+
+services:
+  redis-aws:
+    <<: *valkey
+    ports: ["16379:6379"]
+  redis-gcp:
+    <<: *valkey
+    ports: ["26379:6379"]
+
+  proxy:          # central RESP proxy on the management host (fixed address for every app)
+    build: ../proxy
+    environment:
+      STATEMIG_ENDPOINTS: aws=redis://app:apppw@redis-aws:6379,gcp=redis://app:apppw@redis-gcp:6379
+      STATEMIG_ACTIVE: aws
+      STATEMIG_CONTROL_FILE: /state/control.json
+      STATEMIG_ADMIN_TOKEN: *admin_token
+      STATEMIG_CLIENTS: app:app-proxy-pw:app,worker:worker-proxy-pw:worker
+    volumes: ["control:/state"]
+    ports: ["16380:6379", "17000:7000"]
+    depends_on: [redis-aws, redis-gcp]
+
+  syncworker:     # Sync Worker: notifications + scan copy, reverse sync after cutover
+    build: ../proxy
+    entrypoint: ["statemig-syncworker"]
+    environment:
+      STATEMIG_ENDPOINTS: *admin_eps
+      STATEMIG_ADMIN_TOKEN: *admin_token
+    ports: ["17100:7100"]
+    depends_on: [redis-aws, redis-gcp]
+
+  statemig:       # control plane: the cutover / rollback steps
+    build: ..
+    command: uvicorn statemig.api:app --host 0.0.0.0 --port 8090 --timeout-keep-alive 120
+    environment:
+      STATEMIG_ENDPOINTS: *admin_eps
+      STATEMIG_PROXY: http://proxy:7000
+      STATEMIG_SYNCWORKER: http://syncworker:7100
+      STATEMIG_CONTROL_FILE: /state/control.json
+      STATEMIG_APP_USER: app
+      STATEMIG_APP_PASSWORD: apppw
+      STATEMIG_ADMIN_TOKEN: *admin_token
+    volumes: ["control:/state"]
+    ports: ["18090:8090"]
+    depends_on: [proxy, syncworker]
+
+  app:            # 치이카와 공구앱
+    build: ..
+    command: uvicorn demo.app.main:app --host 0.0.0.0 --port 8000 --workers 4 --timeout-keep-alive 120
+    environment:
+      REDIS_URL: redis://app:app-proxy-pw@proxy:6379
+      APP_DB: /data/app.db
+    volumes: ["appdata:/data"]
+    ports: ["18000:8000"]
+    depends_on: [proxy]
+
+  worker1:
+    build: ..
+    command: python -m demo.app.worker --name w1 --reconciler
+    environment: &workerenv
+      REDIS_URL: redis://worker:worker-proxy-pw@proxy:6379
+      APP_DB: /data/app.db
+    volumes: ["appdata:/data"]
+    depends_on: [app]
+
+  worker2:
+    build: ..
+    command: python -m demo.app.worker --name w2
+    environment: *workerenv
+    volumes: ["appdata:/data"]
+    depends_on: [app]
+
+  loadgen:        # demo console's load, inside the network so port forwarding does not skew latency
+    build: ..
+    command: uvicorn demo.loadgen:app --host 0.0.0.0 --port 8100 --timeout-keep-alive 120
+    environment:
+      APP_URL: http://app:8000
+    ports: ["18100:8100"]
+    depends_on: [app]
+
+volumes:
+  control:
+  appdata:

@@ -1,0 +1,22 @@
+# Benchmark overlay: the Sync Worker and the control plane reach the source Redis
+# through a forwarder that adds environment-to-environment latency.
+x-bench-eps: &bench_eps aws=redis://default:adminpw@lat-aws:6379,gcp=redis://default:adminpw@redis-gcp:6379
+
+services:
+  lat-aws:
+    build: ../proxy
+    entrypoint: ["statemig-latency"]
+    environment:
+      TARGET: redis-aws:6379
+      DELAY_MS: ${BENCH_DELAY_MS:-15}
+    depends_on: [redis-aws]
+
+  syncworker:
+    environment:
+      STATEMIG_ENDPOINTS: *bench_eps
+    depends_on: [lat-aws, redis-gcp]
+
+  statemig:
+    environment:
+      STATEMIG_ENDPOINTS: *bench_eps
+    depends_on: [lat-aws, proxy, syncworker]

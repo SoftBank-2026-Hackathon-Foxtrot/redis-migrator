@@ -1,0 +1,113 @@
+{
+  "mode": "normal",
+  "sessions_lost_in_normal_rollback": 0,
+  "rollback_window": {
+    "requests": 378,
+    "failed": 0,
+    "p50_ms": 656.0,
+    "p99_ms": 3250.0,
+    "max_ms": 6328.0
+  },
+  "failure_log": [],
+  "load": {
+    "requests": 2942,
+    "failed": 0,
+    "p50_ms": 687.0,
+    "p99_ms": 3750.0,
+    "max_ms": 6734.0
+  },
+  "failed": 0,
+  "session_lost": 0,
+  "invariants": {
+    "ok": true,
+    "violations": [],
+    "statuses": {
+      "CONFIRMED": 649,
+      "SOLD_OUT": 240
+    },
+    "stats": {},
+    "notifications": {
+      "close": 10,
+      "confirmed": 649,
+      "sold_out": 240
+    }
+  },
+  "order": {
+    "cutover 1": {
+      "pre": 264,
+      "post": 624,
+      "last_pre_ms": 1793498113994,
+      "first_post_ms": 1793498114543,
+      "ok": true
+    },
+    "normal rollback": {
+      "pre": 415,
+      "post": 473,
+      "last_pre_ms": 1793498121561,
+      "first_post_ms": 1793498122589,
+      "ok": true
+    },
+    "cutover 2": {
+      "pre": 746,
+      "post": 143,
+      "last_pre_ms": 1793498138072,
+      "first_post_ms": 1793498139072,
+      "ok": true
+    }
+  },
+  "checks": [
+    {
+      "label": "cutover 1",
+      "fence_ok": true,
+      "deletes_ok": true,
+      "cache_ok": true,
+      "window": [
+        1793498114.0192246,
+        1793498114.1099937
+      ],
+      "paused_ms": 86.512,
+      "latency_around_pause": {
+        "requests": 84,
+        "failed": 0,
+        "p50_ms": 703.0,
+        "p99_ms": 3734.0,
+        "max_ms": 3734.0
+      }
+    },
+    {
+      "label": "normal rollback",
+      "fence_ok": true,
+      "window": [
+        1793498121.6009321,
+        1793498121.701735
+      ],
+      "paused_ms": 95.077,
+      "latency_around_pause": {
+        "requests": 81,
+        "failed": 0,
+        "p50_ms": 531.0,
+        "p99_ms": 6328.0,
+        "max_ms": 6328.0
+      }
+    },
+    {
+      "label": "cutover 2",
+      "fence_ok": true,
+      "deletes_ok": true,
+      "cache_ok": true,
+      "window": [
+        1793498138.1028545,
+        1793498138.1978874
+      ],
+      "paused_ms": 90.616,
+      "latency_around_pause": {
+        "requests": 80,
+        "failed": 0,
+        "p50_ms": 688.0,
+        "p99_ms": 3453.0,
+        "max_ms": 3453.0
+      }
+    }
+  ],
+  "pass_": true
+}

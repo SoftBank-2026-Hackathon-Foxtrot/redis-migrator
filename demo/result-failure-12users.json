@@ -1,0 +1,88 @@
+{
+  "mode": "failure",
+  "failure_times": {
+    "kill_start": 1793498006.0497992,
+    "killed": 1793498006.7287757,
+    "rollback_done": 1793498006.8317857
+  },
+  "failure": {
+    "rollback_call_ms": 103,
+    "paused_ms": 11.345,
+    "reverse_backlog_at_failure": 0,
+    "sessions_lost": 0,
+    "failed_requests_kill_to_rollback": 4,
+    "failed_requests_after_rollback": 0,
+    "cache_ok_after_rollback": true,
+    "app_write_on_aws": "write allowed"
+  },
+  "failure_log": [
+    [
+      1793498006.739,
+      "500 Internal Server Error"
+    ],
+    [
+      1793498006.741,
+      "500 Internal Server Error"
+    ],
+    [
+      1793498006.746,
+      "500 Internal Server Error"
+    ],
+    [
+      1793498006.749,
+      "500 Internal Server Error"
+    ]
+  ],
+  "load": {
+    "requests": 1603,
+    "failed": 4,
+    "p50_ms": 47.0,
+    "p99_ms": 156.0,
+    "max_ms": 3687.0
+  },
+  "failed": 4,
+  "session_lost": 0,
+  "invariants": {
+    "ok": true,
+    "violations": [],
+    "statuses": {
+      "CONFIRMED": 483
+    },
+    "stats": {
+      "worker_redis_errors": 4
+    },
+    "notifications": {
+      "confirmed": 483
+    }
+  },
+  "order": {
+    "cutover 1": {
+      "pre": 174,
+      "post": 308,
+      "last_pre_ms": 1793498000905,
+      "first_post_ms": 1793498001425,
+      "ok": true
+    }
+  },
+  "checks": [
+    {
+      "label": "cutover 1",
+      "fence_ok": true,
+      "deletes_ok": true,
+      "cache_ok": true,
+      "window": [
+        1793498000.9071383,
+        1793498000.9563673
+      ],
+      "paused_ms": 44.427,
+      "latency_around_pause": {
+        "requests": 73,
+        "failed": 0,
+        "p50_ms": 62.0,
+        "p99_ms": 172.0,
+        "max_ms": 172.0
+      }
+    }
+  ],
+  "pass_": true
+}

@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis 이전 콘솔</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f4f1; --panel: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #7c7b76; --line: #dfdfd9;
+  --s1: #2a78d6; --s2: #eb6834; --accent: #2a78d6; --accent-ink: #fff;
+  --good: #0ca30c; --good-ink: #0a7a0a; --warn-bg: #fdf1d6; --warn-ink: #7a5600;
+  --crit: #d03b3b; --crit-ink: #b52d2d; --chip: #ecece7; --active-bg: #e7f0fb;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #111110; --panel: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #94938a; --line: #33332f;
+    --s1: #3987e5; --s2: #d95926; --accent: #3987e5; --accent-ink: #0b0b0b;
+    --good-ink: #4fc64f; --warn-bg: #3a2e12; --warn-ink: #f0c869;
+    --crit-ink: #f07a7a; --chip: #2a2a27; --active-bg: #1b2a3d;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); }
+body { font: 15px/1.45 "Pretendard", "Malgun Gothic", "Apple SD Gothic Neo", system-ui, sans-serif; padding: 16px; }
+code, .num { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-variant-numeric: tabular-nums; }
+.wrap { max-width: 1500px; margin: 0 auto; display: grid; gap: 12px; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; }
+h1 { font-size: 20px; margin: 0; }
+header small { color: var(--ink-2); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
+h2 { font-size: 13px; color: var(--ink-2); font-weight: 600; margin: 0 0 10px; }
+
+/* route */
+.route { display: grid; grid-template-columns: minmax(150px, 1fr) 40px minmax(200px, 1.2fr) 40px minmax(320px, 2.4fr); align-items: stretch; }
+.node { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.node h3 { margin: 0 0 4px; font-size: 15px; }
+.node p { margin: 2px 0; color: var(--ink-2); font-size: 13px; }
+.arrow { display: flex; align-items: center; justify-content: center; color: var(--ink-3); font-size: 20px; }
+.proxy.paused { border-color: var(--crit); box-shadow: inset 0 0 0 1px var(--crit); }
+.big { font-size: 20px; font-weight: 700; }
+.redis-col { display: grid; gap: 6px; }
+.redis { display: grid; grid-template-columns: 170px 1fr; gap: 10px; align-items: center; }
+.redis.active { border-color: var(--accent); background: var(--active-bg); }
+.redis.down { border-color: var(--crit); }
+.keys { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 6px 8px; }
+.keys div { font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+.keys b { display: block; font-size: 16px; color: var(--ink); font-weight: 600; }
+.badge { display: inline-block; font-size: 12px; padding: 1px 7px; border-radius: 10px; background: var(--chip); color: var(--ink-2); }
+.badge.on { background: var(--accent); color: var(--accent-ink); }
+.badge.bad { background: var(--crit); color: #fff; }
+.badge.warn { background: var(--warn-bg); color: var(--warn-ink); }
+.sync { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; padding: 3px 12px; font-size: 13px; color: var(--ink-2); }
+.sync b { color: var(--ink); font-weight: 600; }
+
+/* main grid */
+.main { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 12px; }
+.left, .right { display: grid; gap: 12px; align-content: start; min-width: 0; }
+.btns { display: grid; gap: 6px; }
+button { font: inherit; font-weight: 600; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; text-align: left; display: flex; justify-content: space-between; gap: 8px; }
+button small { font-weight: 400; color: var(--ink-3); }
+button:hover:not(:disabled) { border-color: var(--ink-3); }
+button.next { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+button.next small { color: inherit; opacity: .85; }
+button.danger:not(:disabled) { color: var(--crit-ink); border-color: var(--crit); }
+button:disabled { opacity: .45; cursor: default; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.sep { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }
+.err { color: var(--crit-ink); font-size: 13px; min-height: 18px; margin-top: 6px; overflow-wrap: anywhere; }
+
+.tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+.tile { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; background: var(--panel); }
+.tile span { font-size: 12px; color: var(--ink-2); display: block; }
+.tile b { font-size: 24px; font-weight: 700; }
+.tile b.bad { color: var(--crit-ink); }
+.tile em { font-style: normal; font-size: 12px; color: var(--ink-3); margin-left: 3px; }
+
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; align-items: center; }
+.legend i { display: inline-block; width: 16px; height: 2px; vertical-align: middle; margin-right: 5px; }
+.tip { position: absolute; pointer-events: none; background: var(--ink); color: var(--panel); font-size: 12px; padding: 5px 8px; border-radius: 5px; white-space: nowrap; display: none; z-index: 2; }
+
+.steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 6px; }
+.steps li { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 0; }
+.steps li.done { border-color: var(--good); }
+.steps li.wait { border-color: var(--warn-ink); }
+.steps b { display: block; font-size: 12px; overflow-wrap: anywhere; }
+.steps span { font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+td, th { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+th { color: var(--ink-2); font-weight: 600; }
+.ok { color: var(--good-ink); font-weight: 700; white-space: nowrap; }
+.no { color: var(--crit-ink); font-weight: 700; white-space: nowrap; }
+.log { max-height: 240px; overflow: auto; font-size: 13px; }
+.log div { padding: 3px 0; border-bottom: 1px solid var(--line); }
+.log time { color: var(--ink-3); margin-right: 8px; }
+.log .good { color: var(--good-ink); }
+.log .bad { color: var(--crit-ink); }
+.bottom { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; }
+.empty { color: var(--ink-3); font-size: 13px; }
+@media (max-width: 1100px) {
+  .route { grid-template-columns: 1fr; }
+  .arrow { transform: rotate(90deg); height: 28px; }
+  .main, .bottom { grid-template-columns: 1fr; }
+  .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .redis { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Redis 무중단 이전</h1>
+    <small>로컬 환경: Valkey 컨테이너 2대가 AWS·GCP 역할, 원본 DB는 SQLite. 실제 클라우드가 아닙니다.</small>
+  </header>
+
+  <section class="panel">
+    <h2>지금 요청이 가는 길 <small style="font-weight:400">(큐 숫자 = 미처리 / ack 대기)</small></h2>
+    <div class="route">
+      <div class="node">
+        <h3>공구앱 + 큐 워커</h3>
+        <p>Redis 주소는 항상 프록시 하나</p>
+        <p id="appLine"></p>
+      </div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="node proxy" id="proxyNode">
+        <h3>중앙 프록시</h3>
+        <div class="big" id="proxyState">-</div>
+        <p id="proxyRoute"></p>
+        <p id="proxyGen"></p>
+      </div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="redis-col" id="sides"></div>
+    </div>
+  </section>
+
+  <div class="main">
+    <div class="left">
+      <section class="panel">
+        <h2>진행</h2>
+        <div class="btns" id="btns"></div>
+        <div class="err" id="err" role="alert"></div>
+      </section>
+    </div>
+    <div class="right">
+      <div class="tiles" id="tiles"></div>
+      <section class="panel">
+        <h2>요청 응답 시간 (초당 p50 · p99, 최근 2분)</h2>
+        <div class="legend"><span><i style="background:var(--s1)"></i>p50</span><span><i style="background:var(--s2)"></i>p99</span></div>
+        <div class="chart" id="latChart"><svg role="img" aria-label="초당 응답 시간"></svg><div class="tip"></div></div>
+      </section>
+      <section class="panel">
+        <h2>초당 실패 요청</h2>
+        <div class="chart" id="failChart"><svg role="img" aria-label="초당 실패 요청 수"></svg><div class="tip"></div></div>
+      </section>
+    </div>
+  </div>
+
+  <section class="panel">
+    <h2 id="stepsTitle">마지막 전환 단계</h2>
+    <div id="steps"><p class="empty">아직 전환 전입니다.</p></div>
+  </section>
+
+  <div class="bottom">
+    <section class="panel">
+      <h2>검증 결과</h2>
+      <div id="checks"><p class="empty">검증을 누르면 부하를 멈추고 설계의 완료 기준을 확인합니다.</p></div>
+    </section>
+    <section class="panel">
+      <h2>기록</h2>
+      <div class="log" id="log"></div>
+    </section>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const STATE = { PRECHECK: '사전 확인', SYNCING: '동기화 중', DRAINING: '큐 drain 중', CUTOVER: '전환 완료',
+  ROLLING_BACK_DRAIN: '롤백 뒤 큐 drain 중', ROLLED_BACK: '롤백 완료', COMMITTED: '커밋 완료', FAILED: '실패', ABORTED: '전환 되돌림' };
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const clock = t => new Date(t * 1000).toTimeString().slice(0, 8);
+const n0 = x => x == null ? '-' : Math.round(x).toLocaleString('ko-KR');
+let S = null, errMsg = '';
+
+async function act(path, body) {
+  errMsg = ''; $('err').textContent = '';
+  try {
+    const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); errMsg = d.detail || r.statusText; }
+  } catch (e) { errMsg = String(e); }
+  $('err').textContent = errMsg;
+  tick();
+}
+
+function buttons(s) {
+  const m = s.status.migration, px = s.status.proxy, st = m && m.state;
+  const active = px ? px.active : null, target = active === 'aws' ? 'gcp' : 'aws';
+  const seeded = !!px, loadOn = s.load.running, busy = !!s.busy;
+  const canStart = seeded && (!m || ['ROLLED_BACK', 'COMMITTED', 'FAILED', 'ABORTED'].includes(st)) && !s.killed && px.active === px.consume;
+  const hasLoadData = s.series.length > 0;
+  const defs = [
+    { label: '초기화', hint: '30초쯤', on: true, go: () => act('/api/reset'), key: 'reset' },
+    { label: loadOn ? '부하 중지' : '부하 시작', hint: s.load.users ? `사용자 ${s.load.users}명` : '', on: seeded && !s.killed, go: () => act(loadOn ? '/api/load/stop' : '/api/load/start'), key: 'load' },
+    { label: `동기화 시작`, hint: active ? `${active} → ${target}` : '', on: canStart, go: () => act('/api/sync', { target }), key: 'sync' },
+    { label: '컷오버', hint: s.ready ? '준비됨' : (st === 'SYNCING' ? '전체 비교 중' : ''), on: s.ready, go: () => act('/api/cutover'), key: 'cutover' },
+    { sep: true },
+    { label: '정상 롤백', hint: st === 'DRAINING' ? 'drain 뒤 가능' : '', on: st === 'CUTOVER' && !s.killed, go: () => act('/api/rollback/normal'), key: 'rb' },
+    { label: '커밋', hint: '이전 확정', on: st === 'CUTOVER' && !s.killed, go: () => act('/api/commit'), key: 'commit' },
+    { sep: true },
+    { label: '장애 주입', hint: m ? `redis-${m.target} kill` : '', on: ['CUTOVER', 'DRAINING'].includes(st) && !s.killed, go: () => act('/api/kill'), key: 'kill', danger: true },
+    { label: '장애 롤백', hint: s.killed ? '원본으로 복귀' : '', on: !!s.killed && ['CUTOVER', 'DRAINING'].includes(st), go: () => act('/api/rollback/failure'), key: 'frb', danger: true },
+    { label: '죽인 Redis 복구', hint: s.killed ? `redis-${s.killed}` : '', on: !!s.killed && st === 'ROLLED_BACK', go: () => act('/api/recover'), key: 'rec' },
+    { sep: true },
+    { label: '검증', hint: '부하 중지 후 확인', on: seeded && hasLoadData && !['SYNCING', 'PRECHECK'].includes(st), go: () => act('/api/verify'), key: 'verify' },
+  ];
+  // the recommended next step gets the primary style
+  let next = null;
+  if (!seeded) next = 'reset';
+  else if (s.killed && ['CUTOVER', 'DRAINING'].includes(st)) next = 'frb';
+  else if (!loadOn && !hasLoadData) next = 'load';
+  else if (canStart && !s.checks) next = !m ? 'sync' : null;
+  else if (s.ready) next = 'cutover';
+  const box = $('btns');
+  const sig = JSON.stringify(defs.map(d => d.sep ? 0 : [d.label, d.hint, d.on && !busy, d.key === next]));
+  if (box.dataset.sig !== sig) {
+    box.dataset.sig = sig;
+    box.innerHTML = '';
+    for (const d of defs) {
+      if (d.sep) { box.append(Object.assign(document.createElement('hr'), { className: 'sep' })); continue; }
+      const b = document.createElement('button');
+      b.dataset.key = d.key;
+      b.disabled = !d.on || busy;
+      b.className = (d.key === next ? 'next ' : '') + (d.danger ? 'danger' : '');
+      b.innerHTML = `<span>${esc(d.label)}</span><small>${esc(d.hint)}</small>`;
+      box.append(b);
+    }
+  }
+  for (const d of defs) if (!d.sep) { const el = box.querySelector(`[data-key=${d.key}]`); if (el) el.onclick = d.go; }
+}
+
+function route(s) {
+  const px = s.status.proxy;
+  $('appLine').textContent = s.load.running ? `요청 중: 초당 ${n0(s.load.rps)}건` : '부하 없음';
+  const node = $('proxyNode');
+  if (!px) { $('proxyState').textContent = s.busy === '초기화' ? '시작 중' : '연결 안 됨'; $('proxyRoute').textContent = ''; $('proxyGen').textContent = ''; node.classList.remove('paused'); return; }
+  node.classList.toggle('paused', !!px.paused);
+  $('proxyState').textContent = px.paused ? '쓰기 정지 중' : '전달 중';
+  $('proxyRoute').innerHTML = `읽기·쓰기 → <b>${esc(px.active)}</b>, 큐 consume → <b>${esc(px.consume)}</b>`;
+  $('proxyGen').innerHTML = `generation <span class="num">${px.gen}</span> · 마지막 쓰기 정지 <span class="num">${px.last_pause_ms ? px.last_pause_ms.toFixed(0) + 'ms' : '-'}</span>`;
+}
+
+function sideCard(name, s) {
+  const x = s.sides[name], px = s.status.proxy, isActive = px && px.active === name;
+  const consume = px && px.consume === name && px.active !== name;
+  if (!x) return `<div class="node redis"><h3>${name}</h3></div>`;
+  let badge = '<span class="badge">대기</span>';
+  if (!x.up) badge = '<span class="badge bad">중단</span>';
+  else if (isActive) badge = '<span class="badge on">활성</span>';
+  else if (consume) badge = '<span class="badge warn">큐 drain 중</span>';
+  const j = x.streams && x.streams['q:join'], nt = x.streams && x.streams['q:notify'];
+  const q = st => st ? `${n0(st.lag)}/${n0(st.pending)}` : '-';
+  const keys = x.up ? `<div class="keys">
+    <div><b class="num">${n0(x.session)}</b>session</div>
+    <div><b class="num">${n0(x.cache)}</b>cache</div>
+    <div><b class="num">${n0(x.rl)}</b>rl</div>
+    <div><b class="num">${n0(x.delayed)}</b>q:delayed</div>
+    <div title="미처리 / ack 대기"><b class="num">${q(j)}</b>q:join</div>
+    <div title="미처리 / ack 대기"><b class="num">${q(nt)}</b>q:notify</div></div>` : `<div class="empty">응답 없음</div>`;
+  return `<div class="node redis ${isActive ? 'active' : ''} ${x.up ? '' : 'down'}"><div><h3>${name} Redis</h3>${badge}</div>${keys}</div>`;
+}
+
+function sides(s) {
+  const sy = s.status.sync, m = s.status.migration;
+  let line = '<span>Sync Worker: 멈춤</span>';
+  if (sy && sy.running) {
+    const d = sy.sync;
+    const rev = m && !['SYNCING', 'PRECHECK'].includes(m.state);
+    line = `<span>Sync Worker${rev ? ' (역방향)' : ''}: <b>${esc(d.src)} → ${esc(d.dst)}</b></span>
+      <span>미처리 키 <b class="num">${n0(d.backlog)}</b></span>
+      <span>복사 <b class="num">${n0(d.copied)}</b></span>
+      <span>삭제 <b class="num">${n0(d.deleted)}</b></span>
+      <span>방식 <b>${esc(d.copy_mode)}</b></span>`;
+  }
+  const html = sideCard('aws', s) + `<div class="sync">${line}</div>` + sideCard('gcp', s);
+  const box = $('sides');
+  if (box.dataset.h !== html) { box.dataset.h = html; box.innerHTML = html; }
+}
+
+function tiles(s) {
+  const l = s.load, m = s.status.migration, r = s.last_result;
+  const fail = l.failed, lost = l.session_lost;
+  const html = [
+    ['상태', m ? (STATE[m.state] || m.state) : '이전 전', ''],
+    ['응답 p50', l.running && l.p50 != null ? n0(l.p50) : '-', 'ms'],
+    ['실패 요청', n0(fail), `/ ${n0(l.ok + l.failed)}`, fail > 0],
+    ['세션 유실', n0(lost), '건', lost > 0],
+    ['마지막 쓰기 정지', r ? n0(r.paused_ms) : '-', 'ms'],
+  ].map(([t, v, u, bad]) => `<div class="tile"><span>${t}</span><b class="${bad ? 'bad' : ''}" style="${t === '상태' ? 'font-size:18px' : ''}">${esc(v)}</b><em>${esc(u)}</em></div>`).join('');
+  if ($('tiles').dataset.h !== html) { $('tiles').dataset.h = html; $('tiles').innerHTML = html; }
+}
+
+function niceMax(v) {
+  const steps = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
+  return steps.find(x => x >= v) || v;
+}
+
+function drawChart(rootId, s, opt) {
+  const root = $(rootId), svg = root.querySelector('svg'), tip = root.querySelector('.tip');
+  const W = Math.max(300, root.clientWidth), H = opt.h, m = { l: 44, r: 34, t: 16, b: 20 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b, t1 = Math.floor(s.now), t0 = t1 - s.chart_seconds;
+  const X = t => m.l + (t - t0) / (t1 - t0) * iw;
+  const pts = s.series.filter(p => p.t >= t0);
+  const maxV = niceMax(Math.max(opt.minMax, ...pts.map(opt.top)));
+  const Y = v => m.t + ih - (v / maxV) * ih;
+  let g = '';
+  for (let i = 0; i <= 2; i++) {
+    const v = maxV * i / 2;
+    g += `<line x1="${m.l}" x2="${W - m.r}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--line)"/>
+      <text x="${m.l - 6}" y="${Y(v) + 4}" text-anchor="end" font-size="11" fill="var(--ink-3)">${n0(v)}</text>`;
+  }
+  for (let sec = 0; sec <= s.chart_seconds; sec += 30) {
+    const x = X(t1 - sec);
+    g += `<text x="${x}" y="${H - 5}" text-anchor="${sec === 0 ? 'end' : 'middle'}" font-size="11" fill="var(--ink-3)">${sec === 0 ? '지금' : `-${sec}초`}</text>`;
+  }
+  // action markers
+  const marks = s.notes.filter(n => n.marker && n.t >= t0);
+  marks.forEach((n, i) => {
+    const x = X(n.t);
+    const c = n.kind === 'bad' ? 'var(--crit)' : 'var(--ink-3)';
+    g += `<line x1="${x}" x2="${x}" y1="${m.t}" y2="${m.t + ih}" stroke="${c}" stroke-dasharray="3 3"/>`;
+    if (opt.labels) {
+      const short = n.label.split(':')[0];
+      const anchor = x > W - 170 ? 'end' : 'start', dx = anchor === 'end' ? -4 : 4;
+      g += `<text x="${x + dx}" y="${m.t + 10 + (i % 2) * 13}" text-anchor="${anchor}" font-size="11" fill="var(--ink-2)">${esc(short)}</text>`;
+    }
+  });
+  g += opt.marks(pts, X, Y, m, ih);
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('height', H);
+  svg.innerHTML = g + `<line class="cross" y1="${m.t}" y2="${m.t + ih}" stroke="var(--ink-2)" style="display:none"/>`;
+  const cross = svg.querySelector('.cross');
+  root.onmousemove = e => {
+    const rect = svg.getBoundingClientRect(), mx = (e.clientX - rect.left) * W / rect.width;
+    if (!pts.length) return;
+    const p = pts.reduce((a, b) => Math.abs(X(b.t) - mx) < Math.abs(X(a.t) - mx) ? b : a);
+    const x = X(p.t);
+    cross.setAttribute('x1', x); cross.setAttribute('x2', x); cross.style.display = '';
+    tip.innerHTML = opt.tip(p); tip.style.display = 'block';
+    const px = x / W * rect.width, tw = tip.offsetWidth;
+    tip.style.left = Math.min(rect.width - tw, Math.max(0, px + 10)) + 'px'; tip.style.top = '2px';
+  };
+  root.onmouseleave = () => { cross.style.display = 'none'; tip.style.display = 'none'; };
+}
+
+function pathOf(pts, X, Y, key) {
+  let d = '', prev = null;
+  for (const p of pts) {          // a gap of missing seconds breaks the line
+    d += (prev !== null && p.t - prev <= 2 ? 'L' : 'M') + X(p.t).toFixed(1) + ' ' + Y(p[key]).toFixed(1);
+    prev = p.t;
+  }
+  return d;
+}
+
+function charts(s) {
+  drawChart('latChart', s, {
+    h: 200, minMax: 100, labels: true, top: p => p.p99,
+    marks: (pts, X, Y) => {
+      const last = pts[pts.length - 1];
+      let ends = '';
+      if (last) {        // direct labels, pushed apart when the two lines nearly touch
+        const y50 = Y(last.p50), y99 = Y(last.p99), gap = 12 - (y50 - y99);
+        const l50 = y50 + 4 + Math.max(0, gap / 2), l99 = y99 + 4 - Math.max(0, gap / 2);
+        ends = `<circle cx="${X(last.t)}" cy="${y50}" r="3" fill="var(--s1)"/><circle cx="${X(last.t)}" cy="${y99}" r="3" fill="var(--s2)"/>
+          <text x="${X(last.t) + 7}" y="${l50}" font-size="11" fill="var(--ink-2)">p50</text>
+          <text x="${X(last.t) + 7}" y="${l99}" font-size="11" fill="var(--ink-2)">p99</text>`;
+      }
+      return `<path d="${pathOf(pts, X, Y, 'p99')}" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
+        <path d="${pathOf(pts, X, Y, 'p50')}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>` + ends;
+    },
+    tip: p => `${clock(p.t)} · p50 ${n0(p.p50)}ms · p99 ${n0(p.p99)}ms · ${p.n}건`,
+  });
+  drawChart('failChart', s, {
+    h: 90, minMax: 10, labels: false, top: p => p.failed,
+    marks: (pts, X, Y, m, ih) => {
+      const w = Math.max(2, (X(1) - X(0)) - 2);
+      return pts.filter(p => p.failed > 0).map(p => {
+        const y = Y(p.failed), h = Math.max(2, m.t + ih - y);
+        return `<rect x="${X(p.t) - w / 2}" y="${m.t + ih - h}" width="${w}" height="${h}" rx="${Math.min(2, w / 2)}" fill="var(--crit)"/>`;
+      }).join('');
+    },
+    tip: p => `${clock(p.t)} · 실패 ${p.failed}건 / ${p.n}건`,
+  });
+}
+
+function stepsPanel(s) {
+  const r = s.last_result, box = $('steps');
+  let html = '<p class="empty">아직 전환 전입니다.</p>';
+  const ms = v => v == null ? '' : `<span class="num">${(+v).toFixed(v < 10 ? 1 : 0)}ms</span>`;
+  if (r && (r.kind === 'cutover' || r.kind === 'rollback')) {
+    $('stepsTitle').textContent = r.kind === 'cutover' ? `마지막 컷오버 단계 (${r.src} → ${r.dst})` : `마지막 정상 롤백 단계 (${r.src} → ${r.dst})`;
+    const m = s.status.migration;
+    const drained = m && !['DRAINING', 'ROLLING_BACK_DRAIN'].includes(m.state);
+    const items = [
+      ['1. PAUSE', '진행 중 쓰기 대기 ' + ms(r.pause_wait_ms)],
+      ['2. FINAL RECONCILE', `${ms(r.reconcile_ms)}, 전체 비교 뒤 바뀐 키 ${n0(r.reconciled_keys)}개`],
+      ['3. VERIFY', `${ms(r.verify_ms)}: 바뀐 키 + 키 수 + 샘플`],
+      ['4. SWITCH', `gen <span class="num">${r.gen}</span> 기록 후 전환`],
+      ['5. FENCE SOURCE', r.fence === 'acl' ? `${esc(r.src)}에 앱 쓰기 → <span class="num">${esc(r.probe)}</span>` : '권한 회수 불가: 자격 증명 격리'],
+      ['6. REVERSE SYNC', `${esc(r.dst)} → ${esc(r.src)} 구독 확인`],
+      ['7. RESUME', `쓰기 정지 총 ${ms(r.paused_ms)}`],
+      ['8. QUEUE DRAIN', drained ? '원본 큐 비움, consume 전환' : '진행 중 (쓰기 정지와 무관)'],
+    ];
+    html = `<ol class="steps">${items.map(([a, b], i) => `<li class="${i === 7 && !drained ? 'wait' : 'done'}"><b>${a}</b><span>${b}</span></li>`).join('')}</ol>`;
+  } else if (r && r.kind === 'failure') {
+    $('stepsTitle').textContent = '마지막 장애 롤백 결과';
+    const items = [
+      ['쓰기 정지', ms(r.paused_ms)],
+      ['유실 범위', `역방향 미처리 키 <span class="num">${esc(r.reverse_backlog_at_failure)}</span>개`],
+      ['원본 캐시 삭제', `<span class="num">${n0(r.cache_keys_dropped)}</span>개 (DB에서 다시 채움)`],
+      ['전환', `gen <span class="num">${r.gen}</span>, 활성 = 원본`],
+    ];
+    html = `<ol class="steps" style="grid-template-columns:repeat(4,minmax(0,1fr))">${items.map(([a, b]) => `<li class="done"><b>${a}</b><span>${b}</span></li>`).join('')}</ol>`;
+  }
+  if (box.dataset.h !== html) { box.dataset.h = html; box.innerHTML = html; }
+}
+
+function checksPanel(s) {
+  const box = $('checks');
+  let html = s.busy === '검증' ? '<p class="empty">큐에 남은 요청이 처리되길 기다리는 중입니다.</p>'
+    : '<p class="empty">검증을 누르면 부하를 멈추고 설계의 완료 기준을 확인합니다.</p>';
+  if (s.checks) {
+    html = `<table><thead><tr><th>항목</th><th>결과</th><th>근거</th></tr></thead><tbody>` + s.checks.map(c =>
+      `<tr><td>${esc(c.name)}</td><td class="${c.ok ? 'ok' : 'no'}">${c.ok ? '✓ 통과' : '✕ 실패'}</td><td>${esc(c.detail)}</td></tr>`).join('') + '</tbody></table>';
+  }
+  if (box.dataset.h !== html) { box.dataset.h = html; box.innerHTML = html; }
+}
+
+function logPanel(s) {
+  const extra = s.load.error ? [{ t: s.now, kind: 'bad', label: '부하 중단: ' + s.load.error }] : [];
+  const errs = Object.entries(s.load.errors || {}).map(([k, v]) => ({ t: s.now, kind: 'bad', label: `오류 ${v}건: ${k}` }));
+  const items = [...s.notes, ...extra, ...errs].slice().reverse();
+  const html = items.length ? items.map(n => `<div class="${n.kind}"><time class="num">${clock(n.t)}</time>${esc(n.label)}</div>`).join('') : '<p class="empty">기록 없음</p>';
+  const box = $('log');
+  if (box.dataset.h !== html) { box.dataset.h = html; box.innerHTML = html; }
+}
+
+async function tick() {
+  try {
+    S = await (await fetch('/api/state')).json();
+    if (S.busy) $('err').textContent = S.busy + ' 진행 중...'; else $('err').textContent = errMsg;
+    buttons(S); route(S); sides(S); tiles(S); charts(S); stepsPanel(S); checksPanel(S); logPanel(S);
+  } catch (e) { $('err').textContent = '콘솔 서버 연결 실패: ' + e; }
+}
+tick();
+setInterval(tick, 700);
+addEventListener('resize', () => S && charts(S));
+</script>
+</body>
+</html>
