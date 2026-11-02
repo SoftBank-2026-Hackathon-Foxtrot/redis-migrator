@@ -18,6 +18,18 @@
 | `demo/bench.py`, `dataplane/latency.py` | 환경 간 지연을 흉내 내 쓰기 정지 시간을 잰다. 결과는 `demo/bench-results.jsonl` |
 | `demo/compare_dataplanes.py` | Go와 Python을 번갈아 측정한다. 결과는 `demo/compare-results.jsonl` |
 
+## 배포 위치
+
+프록시, Sync Worker, statemig는 AWS 관리 VPC에 둔다. 앱 환경의 리소스를 내려도 관리단은 남는다.
+
+- **앱:** 어느 환경의 앱이든 관리 VPC에 있는 프록시의 고정 주소로 접속한다.
+- **statemig와 프록시:** `control.json`을 공유 볼륨으로 함께 쓰므로 같은 호스트에 둔다.
+- **환경 간 연결:** Tailscale 사설망을 쓴다. 온프레 Valkey는 호스트의 Tailscale 주소로 연다.
+- **관리형 Redis:** ElastiCache와 Memorystore에는 Tailscale을 설치할 수 없어서 각 VPC의 라우터나 피어링을 거친다.
+- **지연:** 전환 뒤에도 Redis 요청은 AWS 관리 VPC의 프록시를 거친다.
+
+이 구성은 아직 실제로 배포해서 검증하지 않았다.
+
 ## 로컬 실행
 
 ```bash
