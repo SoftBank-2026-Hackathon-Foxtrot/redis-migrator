@@ -1,86 +1,125 @@
 # redis-migrator
 
-치이카와 공구앱이 쓰는 Redis(세션·캐시·rate limit·작업 큐)를 다른 환경으로 무중단 이전하는 도구다. 설계는 Notion의 "Redis·큐 무중단 이전 핵심 설계 (통합)" 문서를 따른다. 구현하면서 설계와 달라진 점은 [DESIGN.md](DESIGN.md)에 있다.
+Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 주소만 알고, 전환할 때 쓰기를 잠깐 멈춘 뒤 프록시가 대상 Redis를 바꾼다.
 
-| 디렉터리 | 역할 |
+```text
+앱 → Redis 프록시 → ElastiCache / Memorystore / 온프레 Valkey
+           ↑                     ↑
+       statemig  →  Sync Worker (양쪽 동기화)
+```
+
+| 구성 요소 | 코드 | 포트 | 역할 |
+|---|---|---|---|
+| Redis 프록시 | `proxy/cmd/proxy` | RESP `6379`, 관리 `7000` | 앱의 고정 주소. PAUSE, SWITCH, RESUME |
+| Sync Worker | `proxy/cmd/syncworker` | 관리 `7100` | keyspace 알림과 스캔으로 복사, 역방향 동기화, 값 비교 |
+| statemig | `statemig/` | `8090` | 전환·롤백 단계 실행. 오케스트레이터가 호출 |
+
+`dataplane/`은 프록시와 Sync Worker의 Python 버전이다. 기본은 Go다. 비교는 [PERFORMANCE.md](PERFORMANCE.md)에 있다.
+
+## 공통 API
+
+오케스트레이터가 호출하는 API다. statemig `:8090`에서 제공하며 `Authorization: Bearer <STATEMIG_ADMIN_TOKEN>`이 필요하다.
+
+공통 스펙이 확정되기 전 임시안이다. 경로와 필드는 스펙에 맞춰 바뀔 수 있다.
+
+| 메서드 | 경로 | 본문 | 동작 |
+|---|---|---|---|
+| POST | `/v1/prepare` | `{"target":"gcp","budget_ms":1800,"mode":"delta"}` | 사전 점검 후 동기화 시작 |
+| POST | `/v1/execute` | `{"budget_ms":1800}` | 컷오버 |
+| POST | `/v1/rollback` | `{"mode":"normal","budget_ms":1800}` | 원본으로 복귀. 대상이 죽었으면 `"mode":"failure"` |
+| POST | `/v1/commit` | 없음 | 역방향 동기화를 끝내고 이전 확정 |
+| GET | `/v1/status` | 없음 | 현재 단계와 결과 조회 |
+
+POST는 바로 `202`를 돌려주고 작업은 뒤에서 돈다. 결과는 `/v1/status`로 확인한다.
+
+```json
+{
+  "resource": "redis",
+  "phase": "executed",
+  "ready": false,
+  "source": "aws",
+  "target": "gcp",
+  "active": "gcp",
+  "operation": {"name": "execute", "state": "succeeded", "error": null, "result": {}},
+  "last_cutover": {"paused_ms": 38.9, "total_ms": 42.1},
+  "events": []
+}
+```
+
+| `phase` | 뜻 |
 |---|---|
-| `proxy/` (Go, 기본) | 중앙 RESP 프록시(`cmd/proxy`, RESP `:6379`, admin API `:7000`)와 Sync Worker(`cmd/syncworker`, admin API `:7100`). keyspace 알림 + 양방향 스캔 복사, 역방향 동기화, VERIFY |
-| `dataplane/` (Python) | 같은 프록시와 Sync Worker의 Python 버전. `DATAPLANE=python`으로 쓴다. 비교는 [PERFORMANCE.md](PERFORMANCE.md) |
-| `statemig/` (Python) | 제어부. 컷오버·롤백 단계, 제어 레코드 기록, ACL fence |
-| `onprem/` | 온프레미스용 Valkey 8.0 배포 구성. [onprem/README.md](onprem/README.md) |
-| `demo/app` | 공구앱(FastAPI)과 큐 worker. 원본 데이터는 SQLite(RDB 대용) |
-| `demo/scenario.py` | 부하를 건 채로 설계의 완료 기준을 검사한다 (호스트에서 실행) |
-| `demo/faults.py` | 실패 처리와 권한 제한을 일부러 일으켜 검사한다 (호스트에서 실행) |
-| `demo/onprem_check.py` | 온프레 Valkey로 전환·롤백하고 강제 종료까지 검사한다 (호스트에서 실행) |
-| `demo/aws_check.py` | 실제 ElastiCache를 원본으로 전환·롤백을 검사한다 (같은 VPC의 호스트에서 실행) |
-| `demo/chain_check.py` | aws → 온프레 → gcp를 한 번에 이전하고 마지막 구간의 롤백까지 검사한다 (호스트에서 실행) |
-| `demo/console.py`, `demo/loadgen.py` | 화면 공유용 데모 콘솔과 그 부하 생성기 |
-| `demo/bench.py`, `dataplane/latency.py` | 환경 간 지연을 흉내 내 쓰기 정지 시간을 잰다. 결과는 `demo/bench-results.jsonl` |
-| `demo/compare_dataplanes.py` | Go와 Python을 번갈아 측정한다. 결과는 `demo/compare-results.jsonl` |
+| `idle` | 진행 중인 이전 없음 |
+| `preparing` | 사전 점검 또는 동기화 중 |
+| `ready` | 컷오버 가능 |
+| `executing` | 컷오버 또는 큐 비우기 중 |
+| `executed` | 전환 완료. 롤백이나 commit 가능 |
+| `rolling_back`, `rolled_back` | 롤백 중, 완료 |
+| `committing`, `committed` | 확정 중, 완료 |
+| `aborted` | 컷오버 실패로 원본에 복귀 |
+| `failed` | 사전 점검 실패 |
+
+| 응답 | 경우 |
+|---|---|
+| `400` | 없는 대상이거나 이미 활성인 대상 |
+| `401` | 토큰 없음 |
+| `404` | 준비된 이전 없음 |
+| `409` | 다른 단계가 실행 중 |
+| `422` | 본문 형식 오류 |
+
+단계 실패는 `operation.state`가 `failed`가 되고 `operation.error`에 이유가 남는다. 정상 롤백은 큐를 다 비운 `executed`부터 가능하다.
+
+호출 순서:
+
+```text
+prepare → ready 대기 → execute → executed 대기 → commit
+                                              └→ rollback
+```
+
+## 내부 API
+
+공통 API 아래에서 쓰는 API다. 모두 같은 토큰이 필요하다.
+
+| 서비스 | 경로 |
+|---|---|
+| statemig | `POST /migrations`, `GET /migrations/current/ready`, `POST /migrations/current/{cutover,rollback,commit}`, `GET /status` |
+| 프록시 | `GET /status`, `POST /pause`, `POST /switch`, `POST /resume`, `POST /drain-done` |
+| Sync Worker | `GET /status`, `POST /start`, `POST /precompare`, `POST /reconcile`, `POST /verify`, `POST /reverse`, `POST /stop` |
 
 ## 배포 위치
 
-프록시, Sync Worker, statemig는 AWS 관리 VPC에 둔다. 앱 환경의 리소스를 내려도 관리단은 남는다.
+프록시, Sync Worker, statemig는 AWS 관리 VPC에 둔다. 프록시와 statemig는 `control.json`을 공유하므로 같은 호스트에 둔다.
 
-- **앱:** 어느 환경의 앱이든 관리 VPC에 있는 프록시의 고정 주소로 접속한다.
-- **statemig와 프록시:** `control.json`을 공유 볼륨으로 함께 쓰므로 같은 호스트에 둔다.
-- **환경 간 연결:** Tailscale 사설망을 쓴다. 온프레 Valkey는 호스트의 Tailscale 주소로 연다.
-- **관리형 Redis:** ElastiCache와 Memorystore에는 Tailscale을 설치할 수 없어서 각 VPC의 라우터나 피어링을 거친다.
-- **지연:** 전환 뒤에도 Redis 요청은 AWS 관리 VPC의 프록시를 거친다.
+환경 간 연결은 Tailscale로 한다. ElastiCache와 Memorystore에는 Tailscale을 설치할 수 없어서 각 VPC의 라우터나 피어링을 거친다.
 
-이 구성은 아직 실제로 배포해서 검증하지 않았다.
-
-## 로컬 실행
+## 실행
 
 ```bash
 cd demo && docker compose up -d --build
 ```
 
-Python 버전은 compose 파일을 더한다. 검사 스크립트와 콘솔에는 `DATAPLANE=python` 환경 변수를 주면 된다.
+로컬 관리 토큰은 `demo-admin-token`이고, statemig는 `localhost:18090`이다.
 
-```bash
-cd demo && docker compose -f docker-compose.yml -f python.compose.yml up -d --build
-```
+## 검사
 
-시나리오는 호스트에서 돌린다. 장애 시나리오가 `docker compose kill`을 쓰기 때문이다. `httpx`와 `redis`가 있는 Python이 필요하다.
+스택을 띄우고 호스트에서 실행한다. `httpx`와 `redis`가 필요하다.
 
-```bash
-python demo/scenario.py --mode normal --users 12 --think-ms 150
-```
+| 명령 | 확인 내용 |
+|---|---|
+| `python demo/adapter_check.py` | 공통 API로 prepare, execute, rollback, commit |
+| `python demo/scenario.py --mode normal` | 부하 중 컷오버, 롤백, commit |
+| `python demo/scenario.py --mode failure` | 대상 Redis 강제 종료 후 롤백 |
+| `python demo/faults.py` | 실패 경로와 권한 제한 |
+| `python demo/onprem_check.py` | 온프레 Valkey 전환과 롤백 |
+| `python demo/chain_check.py` | aws → 온프레 → gcp 연속 이전 |
+| `python demo/aws_check.py` | 실제 ElastiCache. 같은 VPC의 호스트에서 실행 |
 
-```bash
-python demo/scenario.py --mode failure --users 12 --think-ms 150
-```
+`demo/app`은 검사에서 부하를 거는 앱이다. 실제 공구앱은 [demo 레포](https://github.com/SoftBank-2026-Hackathon-Foxtrot/demo)에 있다.
 
-- `normal`: aws → gcp 컷오버, 정상 롤백, 다시 컷오버, commit
-- `failure`: 컷오버 뒤 gcp Redis 컨테이너를 kill하고 장애 롤백
-- 결과 상세는 `demo/result-<mode>.json`에 남는다. 시나리오마다 `docker compose down -v`로 초기화한 뒤 돌린다.
+## 아직 안 된 것
 
-실패 경로는 일부러 일으켜 확인한다. 스택을 새로 띄우고 항목별로 검사한다.
+- AWS 관리 VPC 배포와 Tailscale 구간 검증
+- Memorystore 검증
+- 오케스트레이터 연결
+- 공통 스펙 확정 후 API 조정
 
-```bash
-python demo/faults.py
-```
-
-## 제어 API (statemig, `:18090`)
-
-모든 관리 API(statemig, 프록시, Sync Worker)는 `Authorization: Bearer <STATEMIG_ADMIN_TOKEN>`이 있어야 호출된다. 로컬 값은 `demo-admin-token`이다.
-
-| 메서드 | 경로 | 설명 |
-|---|---|---|
-| POST | `/migrations` `{"target":"gcp","budget_ms":1800,"mode":"delta"}` | precheck(알림·권한 실측, 예상 시간), 대상 큐 group 생성, Sync Worker 시작. `delta`(기본)는 쓰기를 멈추기 전에 전체 비교, `full`은 쓰기 정지 안에서 전체 복사·비교 |
-| GET | `/migrations/current/ready` | 동기화 backlog가 작아졌는지 |
-| POST | `/migrations/current/cutover` `{"budget_ms":1800}` | PAUSE → FINAL RECONCILE → VERIFY → SWITCH → FENCE → REVERSE SYNC → RESUME, 이후 큐 drain |
-| POST | `/migrations/current/rollback` `{"mode":"normal"\|"failure"}` | 정상 롤백(대상 생존) / 장애 롤백(대상 소실) |
-| POST | `/migrations/current/commit` | 역방향 동기화 중지 |
-| GET | `/status` | 프록시, Sync Worker, 제어 레코드, 이벤트 |
-
-## 데모 콘솔
-
-버튼으로 한 단계씩 실행하고 프록시, Sync Worker, 양쪽 Redis를 실시간으로 본다. 진행 순서는 [demo/DEMO.md](demo/DEMO.md)에 있다.
-
-```bash
-python demo/console.py
-```
-
-http://localhost:18888 에서 **초기화**부터 누른다. 부하는 compose 안의 `loadgen` 컨테이너가 만든다.
+구현이 설계와 다른 점은 [DESIGN.md](DESIGN.md), 온프레 구성은 [onprem/README.md](onprem/README.md)에 있다.
