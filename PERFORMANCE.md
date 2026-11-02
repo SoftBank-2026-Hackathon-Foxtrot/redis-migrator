@@ -85,6 +85,7 @@ Python 프록시는 전환을 원자적으로 하려고 한 프로세스로 돌�
 |---|---|---|
 | `demo/faults.py` | 22/22 | 22/22 |
 | `demo/onprem_check.py` | 14/14 | 14/14 |
+| `demo/chain_check.py` (aws → 온프레 → gcp) | 9/9 | 9/9 |
 | `demo/scenario.py --mode normal` | 통과 | 통과 |
 | `demo/scenario.py --mode failure` | 통과 | 통과 |
 
