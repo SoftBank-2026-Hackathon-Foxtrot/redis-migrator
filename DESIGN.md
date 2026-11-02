@@ -13,7 +13,8 @@
 
 ## 로컬 검증 범위
 
-- Redis: Valkey 8 두 대(aws, gcp 역할). 실제 ElastiCache / Memorystore에서는 돌려보지 않았다. "CONFIG·ACL이 막힌 Redis"는 ACL 규칙으로 흉내 낸 것이다.
+- Redis: Valkey 8 두 대(aws, gcp 역할). "CONFIG·ACL이 막힌 Redis"는 ACL 규칙으로 흉내 낸 것이다.
+- 실제 ElastiCache for Valkey 8.0은 `demo/aws_check.py`로 2026-11-02에 1회 돌렸다(`cache.t4g.micro`, 같은 VPC의 EC2, TLS, 8/8 통과). `CONFIG`와 `ACL`이 막혀 쓰기 차단은 자격 증명 격리로 동작했고, 앱 사용자는 원본에 직접 쓸 수 있었다. 알림은 파라미터 그룹으로 켰다. Memorystore와 환경 간 VPN은 돌려보지 않았다.
 - 원본 데이터: SQLite(RDB 대용). DB 컷오버는 하지 않았고, Redis 전환만 검증했다.
 - 장애 롤백 때 역방향 backlog는 매번 0이었다. "역방향 미처리분만큼 유실"의 유실이 실제로 생기는 경우는 재현하지 못했다.
 - 쓰기 정지 측정(`demo/bench.py`)은 지연만 흉내 낸 것이다. 대역폭 제한이 없고, 값이 작은 세션 키이며, 변경량이 적은 부하에서 키 수별 1회씩 쟀다.

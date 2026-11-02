@@ -12,6 +12,7 @@
 | `demo/scenario.py` | 부하를 건 채로 설계의 완료 기준을 검사한다 (호스트에서 실행) |
 | `demo/faults.py` | 실패 처리와 권한 제한을 일부러 일으켜 검사한다 (호스트에서 실행) |
 | `demo/onprem_check.py` | 온프레 Valkey로 전환·롤백하고 강제 종료까지 검사한다 (호스트에서 실행) |
+| `demo/aws_check.py` | 실제 ElastiCache를 원본으로 전환·롤백을 검사한다 (같은 VPC의 호스트에서 실행) |
 | `demo/chain_check.py` | aws → 온프레 → gcp를 한 번에 이전하고 마지막 구간의 롤백까지 검사한다 (호스트에서 실행) |
 | `demo/console.py`, `demo/loadgen.py` | 화면 공유용 데모 콘솔과 그 부하 생성기 |
 | `demo/bench.py`, `dataplane/latency.py` | 환경 간 지연을 흉내 내 쓰기 정지 시간을 잰다. 결과는 `demo/bench-results.jsonl` |

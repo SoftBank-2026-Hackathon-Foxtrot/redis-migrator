@@ -1,0 +1,17 @@
+# Real ElastiCache as the aws endpoint, on a host in its VPC. Use on top of onprem.compose.yml:
+#   docker compose -f docker-compose.yml -f onprem.compose.yml -f aws.compose.yml --env-file onprem.env --env-file aws.env up -d --build
+# aws.env holds AWS_ENDPOINT, AWS_ADMIN_PW and AWS_APP_PW.
+x-admin-eps: &admin_eps aws=rediss://default:${AWS_ADMIN_PW}@${AWS_ENDPOINT}:6379,gcp=redis://default:adminpw@redis-gcp:6379,onprem=redis://default:${VALKEY_ADMIN_PASSWORD}@redis-onprem:6379
+
+services:
+  proxy:
+    environment:
+      STATEMIG_ENDPOINTS: aws=rediss://app:${AWS_APP_PW}@${AWS_ENDPOINT}:6379,gcp=redis://app:apppw@redis-gcp:6379,onprem=redis://app:${VALKEY_APP_PASSWORD}@redis-onprem:6379
+
+  syncworker:
+    environment:
+      STATEMIG_ENDPOINTS: *admin_eps
+
+  statemig:
+    environment:
+      STATEMIG_ENDPOINTS: *admin_eps
