@@ -4,8 +4,8 @@
 
 | 디렉터리 | 역할 |
 |---|---|
-| `dataplane/` (Python, 기본) | 중앙 RESP 프록시(`proxy.py`, RESP `:6379`, admin API `:7000`)와 Sync Worker(`syncworker.py`, admin API `:7100`). keyspace 알림 + 양방향 스캔 복사, 역방향 동기화, VERIFY |
-| `proxy/` (Go) | 같은 프록시와 Sync Worker의 Go 버전. `DATAPLANE=go`로 쓴다. 비교는 [PERFORMANCE.md](PERFORMANCE.md) |
+| `proxy/` (Go, 기본) | 중앙 RESP 프록시(`cmd/proxy`, RESP `:6379`, admin API `:7000`)와 Sync Worker(`cmd/syncworker`, admin API `:7100`). keyspace 알림 + 양방향 스캔 복사, 역방향 동기화, VERIFY |
+| `dataplane/` (Python) | 같은 프록시와 Sync Worker의 Python 버전. `DATAPLANE=python`으로 쓴다. 비교는 [PERFORMANCE.md](PERFORMANCE.md) |
 | `statemig/` (Python) | 제어부. 컷오버·롤백 단계, 제어 레코드 기록, ACL fence |
 | `onprem/` | 온프레미스용 Valkey 8.0 배포 구성. [onprem/README.md](onprem/README.md) |
 | `demo/app` | 공구앱(FastAPI)과 큐 worker. 원본 데이터는 SQLite(RDB 대용) |
@@ -23,10 +23,10 @@
 cd demo && docker compose up -d --build
 ```
 
-Go 버전은 compose 파일을 더한다. 검사 스크립트에는 `DATAPLANE=go` 환경 변수를 주면 된다.
+Python 버전은 compose 파일을 더한다. 검사 스크립트와 콘솔에는 `DATAPLANE=python` 환경 변수를 주면 된다.
 
 ```bash
-cd demo && docker compose -f docker-compose.yml -f go.compose.yml up -d --build
+cd demo && docker compose -f docker-compose.yml -f python.compose.yml up -d --build
 ```
 
 시나리오는 호스트에서 돌린다. 장애 시나리오가 `docker compose kill`을 쓰기 때문이다. `httpx`와 `redis`가 있는 Python이 필요하다.

@@ -8,7 +8,7 @@
 | 관리 DB | Migration Worker의 관리 DB | 공유 볼륨의 JSON 파일 2개 (`control.json`, `migration.json`), 원자적 교체 | 로컬 대용 |
 | DB 컷오버와 함께 전환·취소 | 같은 쓰기 정지 구간, 실패 시 함께 취소 | Redis만 전환 | PgBouncer·Migration Worker와 미연결 |
 | 앱이 쓰는 비밀번호 | 시크릿 저장소 참조 | compose 환경 변수 | 로컬 대용 |
-| 프록시 구현 | 미정 | Python(기본)과 Go 두 벌. 관리 API와 동작이 같고 같은 검사를 통과 | 팀 언어 통일과 처리량을 함께 비교하기 위해. 실측은 [PERFORMANCE.md](PERFORMANCE.md) |
+| 프록시 구현 | 미정 | Go(기본)와 Python 두 벌. 관리 API와 동작이 같고 같은 검사를 통과 | 프록시는 한 프로세스여야 해서 여러 코어를 쓰는 Go를 기본으로 한다. Python은 비교용. 실측은 [PERFORMANCE.md](PERFORMANCE.md) |
 | 관리형 Redis의 ACL 변경 API | 회수가 안 되면 자격 증명 격리 | 격리로만 동작. ElastiCache `ModifyUser` 같은 API 호출은 없음 | 반영이 비동기라 쓰기 정지 안에서 기다릴 수 없고, 실제 인스턴스로 시험하지 못함 |
 
 ## 로컬 검증 범위

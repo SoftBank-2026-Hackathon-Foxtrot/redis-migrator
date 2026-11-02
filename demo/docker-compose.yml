@@ -17,8 +17,9 @@ services:
     ports: ["26379:6379"]
 
   proxy:          # central RESP proxy on the management host (fixed address for every app)
-    build: ..
-    command: python -m dataplane.proxy
+    build: ../proxy
+    image: statemig-go
+    entrypoint: ["statemig-proxy"]
     environment:
       STATEMIG_ENDPOINTS: aws=redis://app:apppw@redis-aws:6379,gcp=redis://app:apppw@redis-gcp:6379
       STATEMIG_ACTIVE: aws
@@ -30,8 +31,9 @@ services:
     depends_on: [redis-aws, redis-gcp]
 
   syncworker:     # Sync Worker: notifications + scan copy, reverse sync after cutover
-    build: ..
-    command: python -m dataplane.syncworker
+    build: ../proxy
+    image: statemig-go
+    entrypoint: ["statemig-syncworker"]
     environment:
       STATEMIG_ENDPOINTS: *admin_eps
       STATEMIG_ADMIN_TOKEN: *admin_token

@@ -1,0 +1,13 @@
+# Runs the Python data plane instead of the Go one. The scripts add this file when DATAPLANE=python.
+services:
+  proxy:
+    build: ..
+    image: statemig-python
+    entrypoint: !reset null
+    command: python -m dataplane.proxy
+
+  syncworker:
+    build: ..
+    image: statemig-python
+    entrypoint: !reset null
+    command: python -m dataplane.syncworker

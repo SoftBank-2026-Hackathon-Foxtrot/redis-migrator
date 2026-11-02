@@ -32,8 +32,8 @@ def env_of(impl: str) -> dict:
 
 
 def compose_cmd(impl: str, *args) -> list[str]:
-    go = ["-f", "go.compose.yml"] if impl == "go" else []
-    return ["docker", "compose", "-f", "docker-compose.yml", *go, *args]
+    python = ["-f", "python.compose.yml"] if impl == "python" else []
+    return ["docker", "compose", "-f", "docker-compose.yml", *python, *args]
 
 
 def compose(impl: str, *args) -> str:
