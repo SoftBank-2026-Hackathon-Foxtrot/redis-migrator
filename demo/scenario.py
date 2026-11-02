@@ -28,8 +28,7 @@ ADMIN_HEADERS = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 ADMIN = {"aws": "redis://default:adminpw@localhost:16379", "gcp": "redis://default:adminpw@localhost:26379"}
 APPUSER = {"aws": "redis://app:apppw@localhost:16379", "gcp": "redis://app:apppw@localhost:26379"}
 COMPOSE_DIR = Path(__file__).parent
-PYTHON_FILES = ["-f", "python.compose.yml"] if os.environ.get("DATAPLANE") == "python" else []
-COMPOSE_FILES = ["-f", "docker-compose.yml", *PYTHON_FILES]
+COMPOSE_FILES = ["-f", "docker-compose.yml"]
 ONPREM_FILES = ["-f", "onprem.compose.yml", "--env-file", "onprem.env"]
 GROUPBUYS = 10
 

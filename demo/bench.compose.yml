@@ -5,7 +5,7 @@ x-bench-eps: &bench_eps aws=redis://default:adminpw@lat-aws:6379,gcp=redis://def
 services:
   lat-aws:
     build: ..
-    command: python -m dataplane.latency
+    command: python -m demo.latency
     environment:
       TARGET: redis-aws:6379
       DELAY_MS: ${BENCH_DELAY_MS:-15}

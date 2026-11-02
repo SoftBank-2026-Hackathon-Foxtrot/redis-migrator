@@ -10,11 +10,9 @@ Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 �
 
 | 구성 요소 | 코드 | 포트 | 역할 |
 |---|---|---|---|
-| Redis 프록시 | `proxy/cmd/proxy` | RESP `6379`, 관리 `7000` | 앱의 고정 주소. PAUSE, SWITCH, RESUME |
-| Sync Worker | `proxy/cmd/syncworker` | 관리 `7100` | keyspace 알림과 스캔으로 복사, 역방향 동기화, 값 비교 |
-| statemig | `statemig/` | `8090` | 전환·롤백 단계 실행. 오케스트레이터가 호출 |
-
-`dataplane/`은 프록시와 Sync Worker의 Python 버전이다. 기본은 Go다. 비교는 [PERFORMANCE.md](PERFORMANCE.md)에 있다.
+| Redis 프록시 (Go) | `proxy/cmd/proxy` | RESP `6379`, 관리 `7000` | 앱의 고정 주소. PAUSE, SWITCH, RESUME |
+| Sync Worker (Go) | `proxy/cmd/syncworker` | 관리 `7100` | keyspace 알림과 스캔으로 복사, 역방향 동기화, 값 비교 |
+| statemig (FastAPI) | `statemig/` | `8090` | 전환·롤백 단계 실행. 오케스트레이터가 호출 |
 
 ## 공통 API
 

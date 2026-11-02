@@ -8,9 +8,12 @@ import logging
 import os
 import time
 
-from .admin import split_addr
-
 log = logging.getLogger("statemig.latency")
+
+
+def split_addr(addr: str) -> tuple[str, int]:
+    host, _, port = addr.rpartition(":")
+    return host or "0.0.0.0", int(port)
 
 
 async def relay(r: asyncio.StreamReader, w: asyncio.StreamWriter, delay: float) -> None:
