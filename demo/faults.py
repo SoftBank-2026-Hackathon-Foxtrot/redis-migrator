@@ -349,6 +349,32 @@ async def case_delta_silent_drift(ctl: Ctl):
     await g.aclose()
 
 
+async def case_cache_during_pause(ctl: Ctl):
+    """A commit during PAUSE: its DEL is held. No fill may land after it, no read may see the old value."""
+    active = (await ctl.status())["proxy"]["active"]
+    app_c = aioredis.from_url(PROXY_URL.format("app:app-proxy-pw@"), decode_responses=True)
+    await app_c.set("cache:race:committed", "old", ex=60)
+    async with httpx.AsyncClient(base_url=PROXY_ADMIN, timeout=30, headers=ADMIN_HEADERS) as px:
+        await px.post("/pause", json={"max_wait_ms": 1000})
+        try:
+            read = await asyncio.wait_for(app_c.get("cache:race:committed"), 2)
+            delete = asyncio.create_task(app_c.delete("cache:race:committed"))
+            await asyncio.sleep(0.1)
+            fill = asyncio.create_task(app_c.set("cache:race:committed", "stale", ex=60))
+            await asyncio.sleep(0.3)
+            del_held = not delete.done()
+        finally:
+            await px.post("/resume")
+    await asyncio.gather(fill, delete)
+    await asyncio.sleep(0.2)
+    await app_c.aclose()
+    c = admin(active)
+    left = await c.get("cache:race:committed")
+    await c.aclose()
+    report("PAUSE 중 캐시: 읽기는 미스, 채우기는 버림, 삭제만 보류", read is None and del_held and left is None,
+           f"읽기={read}, 삭제 보류={del_held}, RESUME 뒤 값={left}")
+
+
 async def case_poison_message(ctl: Ctl):
     active = (await ctl.status())["proxy"]["active"]
     c = admin(active)
@@ -445,6 +471,7 @@ async def main():
         await asyncio.sleep(5)
 
         await case_permissions()
+        await case_cache_during_pause(ctl)
         await case_poison_message(ctl)
         await case_delayed_rebuilt(ctl)
         await case_budget_too_small(ctl)

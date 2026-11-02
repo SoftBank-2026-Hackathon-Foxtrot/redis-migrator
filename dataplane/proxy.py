@@ -35,7 +35,8 @@ from collections import deque
 from dataclasses import dataclass, replace
 
 from .admin import ApiError, admin_app, message, require_token, serve, split_addr
-from .keys import CONSUME_CMDS, DENIED_CMDS, PUBSUB_CMDS, ROLE_APP, ROLE_WORKER, CommandTable, deny, load_command_table
+from .keys import (CONSUME_CMDS, DENIED_CMDS, PUBSUB_CMDS, ROLE_APP, ROLE_WORKER, CommandTable, deny,
+                   load_command_table, paused_cache_reply)
 from .resp import (READ_LIMIT, Conn, Endpoint, encode_command, error_reply, parse_endpoints, read_command,
                    read_raw_reply, simple_reply)
 
@@ -73,7 +74,7 @@ class Proxy:
         self.sessions: set[Session] = set()
         self.latency: deque[float] = deque(maxlen=20000)
         self.commands = self.held_commands = self.error_replies = 0
-        self.upstream_errors = self.denied = self.switches = 0
+        self.upstream_errors = self.denied = self.switches = self.cache_bypassed = 0
         self.last_pause_ms = self.max_pause_ms = 0.0
 
     async def serve_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -146,7 +147,7 @@ class Proxy:
                 "paused": self.paused, "inflight_writes": self.inflight, "open_tx": self.tx,
                 "clients": len(self.sessions), "commands": self.commands, "held_commands": self.held_commands,
                 "error_replies": self.error_replies, "upstream_errors": self.upstream_errors, "denied": self.denied,
-                "switches": self.switches, "last_pause_ms": self.last_pause_ms, "max_pause_ms": self.max_pause_ms,
+                "switches": self.switches, "cache_bypassed": self.cache_bypassed, "last_pause_ms": self.last_pause_ms, "max_pause_ms": self.max_pause_ms,
                 "latency_ms": self._latency_summary()}
 
     def _latency_summary(self) -> dict:
@@ -201,6 +202,10 @@ class Session:
     @property
     def in_tx(self) -> bool:
         return self.multi or self.watching
+
+    @property
+    def resp3(self) -> bool:
+        return self.hello is not None and len(self.hello) > 1 and self.hello[1] == b"3"
 
     def close(self):
         p = self.p
@@ -269,6 +274,11 @@ class Session:
             if why:
                 p.denied += 1
                 w.write(error_reply(f"NOPERM {why}"))
+                await w.drain()
+                continue
+            if p.paused and not self.in_tx and (reply := paused_cache_reply(name, args, self.resp3)):
+                p.cache_bypassed += 1
+                w.write(reply)
                 await w.drain()
                 continue
 

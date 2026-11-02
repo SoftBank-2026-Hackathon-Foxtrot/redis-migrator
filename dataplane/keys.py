@@ -52,6 +52,19 @@ async def load_command_table(c: Conn) -> CommandTable:
     return CommandTable(held, keys)
 
 
+def paused_cache_reply(name: str, args: list[bytes], resp3: bool) -> bytes | None:
+    """During PAUSE a cache read is a miss and a cache fill is dropped: cache-aside refills from
+    the DB. A fill held until RESUME could land after the DEL of a commit made in the pause, and
+    a read could return what that DEL is waiting to remove. DEL itself stays held."""
+    if len(args) < 2 or not args[1].startswith(b"cache:"):
+        return None
+    if name == "get":
+        return b"_\r\n" if resp3 else b"$-1\r\n"
+    if name in ("setex", "psetex") or (name == "set" and b"get" not in map(bytes.lower, args[3:])):
+        return b"+OK\r\n"
+    return None
+
+
 def deny(role: str | None, name: str, args: list[bytes], table: CommandTable) -> str:
     """Why the role may not send this command, or "" if it may."""
     if not role:

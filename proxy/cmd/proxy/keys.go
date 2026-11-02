@@ -46,6 +46,33 @@ var (
 	appDeniedCmds  = set("xgroup", "eval", "evalsha", "fcall", "script", "function")
 )
 
+// pausedCacheReply answers a cache command during PAUSE: a read is a miss and a
+// fill is dropped, since cache-aside refills from the DB. A fill held until RESUME
+// could land after the DEL of a commit made in the pause, and a read could return
+// what that DEL is waiting to remove. DEL itself stays held. nil = not answered here.
+func pausedCacheReply(name string, args [][]byte, resp3 bool) []byte {
+	if len(args) < 2 || !bytes.HasPrefix(args[1], []byte("cache:")) {
+		return nil
+	}
+	switch name {
+	case "get":
+		if resp3 {
+			return []byte("_\r\n")
+		}
+		return []byte("$-1\r\n")
+	case "setex", "psetex":
+		return []byte("+OK\r\n")
+	case "set":
+		for _, a := range args[min(3, len(args)):] {
+			if strings.EqualFold(string(a), "get") {
+				return nil
+			}
+		}
+		return []byte("+OK\r\n")
+	}
+	return nil
+}
+
 // deny returns why the role may not send this command, or "" if it may.
 func (r Role) deny(name string, args [][]byte, keys KeyTable) string {
 	if r == "" {

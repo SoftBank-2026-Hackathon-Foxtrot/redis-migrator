@@ -72,7 +72,8 @@ type ProxyStats struct {
 	UpstreamErrors atomic.Int64
 	Denied         atomic.Int64
 	Switches       atomic.Int64
-	LastPauseMs    atomic.Value // float64, PAUSE → RESUME
+	CacheBypassed  atomic.Int64 // cache commands answered by the proxy during PAUSE
+	LastPauseMs   atomic.Value // float64, PAUSE → RESUME
 	MaxPauseMs     atomic.Value
 }
 
@@ -123,9 +124,17 @@ func (p *Proxy) Route() (Route, bool) {
 // Queue consumer commands are neither held nor counted: SWITCH does not move
 // them (they stay on the consume backend until DRAIN_DONE), and a blocking
 // XREADGROUP would otherwise stretch every PAUSE up to its BLOCK timeout.
-func (p *Proxy) enter(name string, inTx bool) (Route, uint64, bool) {
+// A cache command during PAUSE is answered here (the last result), under the same
+// lock, so a fill can't slip past the check and end up held instead of dropped.
+func (p *Proxy) enter(name string, args [][]byte, inTx, resp3 bool) (Route, uint64, bool, []byte) {
 	held := !inTx && !consumeCmds[name] && p.cmds.Held(name)
 	p.mu.Lock()
+	if p.paused && !inTx {
+		if reply := pausedCacheReply(name, args, resp3); reply != nil {
+			p.mu.Unlock()
+			return Route{}, 0, false, reply
+		}
+	}
 	if held && p.paused {
 		p.Stats.HeldCommands.Add(1)
 		for p.paused {
@@ -137,7 +146,7 @@ func (p *Proxy) enter(name string, inTx bool) (Route, uint64, bool) {
 	}
 	r, e := p.route, p.epoch
 	p.mu.Unlock()
-	return r, e, held
+	return r, e, held, nil
 }
 
 func (p *Proxy) exit(held bool, txDelta int) {
@@ -253,6 +262,7 @@ func (p *Proxy) Status() map[string]any {
 	st["upstream_errors"] = p.Stats.UpstreamErrors.Load()
 	st["denied"] = p.Stats.Denied.Load()
 	st["switches"] = p.Stats.Switches.Load()
+	st["cache_bypassed"] = p.Stats.CacheBypassed.Load()
 	st["last_pause_ms"] = p.Stats.LastPauseMs.Load()
 	st["max_pause_ms"] = p.Stats.MaxPauseMs.Load()
 	st["latency_ms"] = p.latency.summary()
@@ -311,6 +321,8 @@ func (s *session) stripHelloAuth(args [][]byte) ([][]byte, bool) {
 }
 
 func (s *session) inTx() bool { return s.multi || s.watching }
+
+func (s *session) resp3() bool { return len(s.hello) > 1 && string(s.hello[1]) == "3" }
 
 func (s *session) close() {
 	p := s.p
@@ -397,7 +409,12 @@ func (s *session) run() {
 
 		t0 := time.Now() // includes time at the gate: the pause shows up in latency honestly
 		wasTx := s.inTx()
-		route, epoch, held := p.enter(name, wasTx)
+		route, epoch, held, answered := p.enter(name, args, wasTx, s.resp3())
+		if answered != nil {
+			p.Stats.CacheBypassed.Add(1)
+			s.reply(answered)
+			continue
+		}
 
 		ep := route.Active
 		switch {
