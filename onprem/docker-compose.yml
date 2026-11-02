@@ -1,0 +1,24 @@
+# Self-run Valkey for an on-premises host. See README.md.
+services:
+  valkey:
+    image: valkey/valkey:8.0
+    entrypoint: ["sh", "/etc/valkey-onprem/start.sh"]
+    environment:
+      VALKEY_ADMIN_PASSWORD: ${VALKEY_ADMIN_PASSWORD:?set it in .env}
+      VALKEY_APP_PASSWORD: ${VALKEY_APP_PASSWORD:?set it in .env}
+      VALKEY_MAXMEMORY: ${VALKEY_MAXMEMORY:-1gb}
+    volumes:
+      - valkey-data:/data
+      - ./valkey.conf:/etc/valkey-onprem/valkey.conf:ro
+      - ./start.sh:/etc/valkey-onprem/start.sh:ro
+    ports:
+      - "${VALKEY_BIND_ADDR:?the VPN address of this host}:${VALKEY_PORT:-6379}:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli --no-auth-warning -a \"$$VALKEY_ADMIN_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  valkey-data:

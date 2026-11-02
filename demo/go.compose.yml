@@ -1,0 +1,13 @@
+# Runs the Go data plane instead of the Python one. The scripts add this file when DATAPLANE=go.
+services:
+  proxy:
+    build: ../proxy
+    image: statemig-go
+    entrypoint: ["statemig-proxy"]
+    command: !reset null
+
+  syncworker:
+    build: ../proxy
+    image: statemig-go
+    entrypoint: ["statemig-syncworker"]
+    command: !reset null

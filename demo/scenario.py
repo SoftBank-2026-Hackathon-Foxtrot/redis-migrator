@@ -28,6 +28,8 @@ ADMIN_HEADERS = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 ADMIN = {"aws": "redis://default:adminpw@localhost:16379", "gcp": "redis://default:adminpw@localhost:26379"}
 APPUSER = {"aws": "redis://app:apppw@localhost:16379", "gcp": "redis://app:apppw@localhost:26379"}
 COMPOSE_DIR = Path(__file__).parent
+GO_FILES = ["-f", "go.compose.yml"] if os.environ.get("DATAPLANE") == "go" else []
+COMPOSE_FILES = ["-f", "docker-compose.yml", *GO_FILES]
 GROUPBUYS = 10
 
 
@@ -240,7 +242,7 @@ def invariants(rep) -> dict:
 
 
 def compose(*args):
-    subprocess.run(["docker", "compose", *args], cwd=COMPOSE_DIR, check=True, capture_output=True)
+    subprocess.run(["docker", "compose", *COMPOSE_FILES, *args], cwd=COMPOSE_DIR, check=True, capture_output=True)
 
 
 async def main():

@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 import httpx
+from redis.exceptions import ResponseError
 
 from .backend import Endpoint
 
@@ -155,6 +156,7 @@ class Migration:
             if ti.get("maxmemory") and ti["maxmemory"] < si.get("used_memory", 0):
                 r["errors"].append("target maxmemory < source used_memory")
             for ep, name, c in ((self.source, "source", src), (self.target, "target", dst)):
+                r["warnings"] += [f"{w} on {name}" for w in await _restart_risks(c)]
                 try:
                     await c.config_set("notify-keyspace-events", "KA")
                 except Exception as e:  # noqa: BLE001  managed Redis: notifications are set by IaC
@@ -503,14 +505,20 @@ class Migration:
 
     # ---- permissions ------------------------------------------------------------------
     async def _set_write(self, ep: Endpoint, allowed: bool):
-        """FENCE: take data writes away from the app user, keep queue consumption."""
+        """FENCE: take data writes away from the app user, keep queue consumption.
+        The user's password is left alone: each Redis has its own."""
         if self.fence_mode.get(ep.name) == "isolated":
             return
         c = ep.client()
         try:
             rules = ["on", "~*", "&*", "+@all"] if allowed else ["on", "~*", "&*", "+@all", "-@write",
                                                                  *CONSUME_CMDS.split()]
-            await c.execute_command("ACL", "SETUSER", self.app_user, "reset", *rules, f"#{_app_pw_hash()}")
+            await c.execute_command("ACL", "SETUSER", self.app_user, *rules)
+            try:
+                await c.execute_command("ACL", "SAVE")
+            except ResponseError as e:
+                if "not configured" not in str(e):   # no aclfile: precheck already warned
+                    raise
         finally:
             await c.aclose()
 
@@ -519,6 +527,21 @@ def _version(info: dict) -> str:
     if "valkey_version" in info:
         return f"valkey {info['valkey_version']}"
     return f"redis {info.get('redis_version')}"
+
+
+async def _restart_risks(c) -> list[str]:
+    """What a restart would undo, as far as CONFIG shows it. Call before turning notifications on."""
+    try:
+        notify = (await c.config_get("notify-keyspace-events")).get("notify-keyspace-events", "")
+        aclfile = (await c.config_get("aclfile")).get("aclfile", "")
+    except Exception:  # noqa: BLE001  managed Redis: the service keeps its own settings
+        return []
+    risks = []
+    if not {"K", "A"} <= set(notify):
+        risks.append("notifications are not in the config file: a restart turns them off")
+    if not aclfile:
+        risks.append("no aclfile: a restart undoes the fence")
+    return risks
 
 
 async def _notifications_work(c) -> bool:
@@ -620,11 +643,6 @@ async def _missing_groups(ep: Endpoint) -> list[str]:
     finally:
         await c.aclose()
     return missing
-
-
-def _app_pw_hash() -> str:
-    import hashlib
-    return hashlib.sha256(os.environ.get("STATEMIG_APP_PASSWORD", "apppw").encode()).hexdigest()
 
 
 async def _queues_empty(c) -> bool:

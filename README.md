@@ -4,20 +4,28 @@
 
 | 디렉터리 | 역할 |
 |---|---|
-| `proxy/cmd/proxy` (Go) | 중앙 RESP 프록시. RESP `:6379`, admin API `:7000` |
-| `proxy/cmd/syncworker` (Go) | Sync Worker. keyspace 알림 + 양방향 스캔 복사, 역방향 동기화, VERIFY. admin API `:7100` |
-| `proxy/internal/redisx` | RESP 코덱, Redis 접속 (두 바이너리가 공유) |
+| `dataplane/` (Python, 기본) | 중앙 RESP 프록시(`proxy.py`, RESP `:6379`, admin API `:7000`)와 Sync Worker(`syncworker.py`, admin API `:7100`). keyspace 알림 + 양방향 스캔 복사, 역방향 동기화, VERIFY |
+| `proxy/` (Go) | 같은 프록시와 Sync Worker의 Go 버전. `DATAPLANE=go`로 쓴다. 비교는 [PERFORMANCE.md](PERFORMANCE.md) |
 | `statemig/` (Python) | 제어부. 컷오버·롤백 단계, 제어 레코드 기록, ACL fence |
+| `onprem/` | 온프레미스용 Valkey 8.0 배포 구성. [onprem/README.md](onprem/README.md) |
 | `demo/app` | 공구앱(FastAPI)과 큐 worker. 원본 데이터는 SQLite(RDB 대용) |
 | `demo/scenario.py` | 부하를 건 채로 설계의 완료 기준을 검사한다 (호스트에서 실행) |
 | `demo/faults.py` | 실패 처리와 권한 제한을 일부러 일으켜 검사한다 (호스트에서 실행) |
+| `demo/onprem_check.py` | 온프레 Valkey로 전환·롤백하고 강제 종료까지 검사한다 (호스트에서 실행) |
 | `demo/console.py`, `demo/loadgen.py` | 화면 공유용 데모 콘솔과 그 부하 생성기 |
-| `demo/bench.py`, `proxy/cmd/latency` | 환경 간 지연을 흉내 내 쓰기 정지 시간을 잰다. 결과는 `demo/bench-results.jsonl` |
+| `demo/bench.py`, `dataplane/latency.py` | 환경 간 지연을 흉내 내 쓰기 정지 시간을 잰다. 결과는 `demo/bench-results.jsonl` |
+| `demo/compare_dataplanes.py` | Go와 Python을 번갈아 측정한다. 결과는 `demo/compare-results.jsonl` |
 
 ## 로컬 실행
 
 ```bash
 cd demo && docker compose up -d --build
+```
+
+Go 버전은 compose 파일을 더한다. 검사 스크립트에는 `DATAPLANE=go` 환경 변수를 주면 된다.
+
+```bash
+cd demo && docker compose -f docker-compose.yml -f go.compose.yml up -d --build
 ```
 
 시나리오는 호스트에서 돌린다. 장애 시나리오가 `docker compose kill`을 쓰기 때문이다. `httpx`와 `redis`가 있는 Python이 필요하다.

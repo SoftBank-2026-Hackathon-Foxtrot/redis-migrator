@@ -14,8 +14,8 @@ import httpx
 import redis.asyncio as aioredis
 from redis.exceptions import AuthenticationError, RedisError
 
-from scenario import (ADMIN, ADMIN_HEADERS, APP, COMPOSE_DIR, CTL, GROUPBUYS, Load, app_can_write, invariants,
-                      wait_processed)
+from scenario import (ADMIN, ADMIN_HEADERS, APP, COMPOSE_DIR, COMPOSE_FILES, CTL, GROUPBUYS, Load, app_can_write,
+                      invariants, wait_processed)
 
 PROXY_ADMIN, SYNC_ADMIN = "http://localhost:17000", "http://localhost:17100"
 PROXY_URL = "redis://{}localhost:16380"
@@ -23,7 +23,8 @@ results: list[tuple[str, bool, str]] = []
 
 
 def compose(*args, check=True) -> str:
-    p = subprocess.run(["docker", "compose", *args], cwd=COMPOSE_DIR, capture_output=True, text=True, check=check)
+    p = subprocess.run(["docker", "compose", *COMPOSE_FILES, *args], cwd=COMPOSE_DIR, capture_output=True, text=True,
+                       check=check)
     return p.stdout
 
 

@@ -17,9 +17,9 @@ from pathlib import Path
 import httpx
 import redis.asyncio as aioredis
 
-from scenario import ADMIN, ADMIN_HEADERS, APP, COMPOSE_DIR, CTL, GROUPBUYS, Load
+from scenario import ADMIN, ADMIN_HEADERS, APP, COMPOSE_DIR, COMPOSE_FILES, CTL, GROUPBUYS, Load
 
-FILES = ["-f", "docker-compose.yml", "-f", "bench.compose.yml"]
+FILES = [*COMPOSE_FILES, "-f", "bench.compose.yml"]
 SEED_TTL_S = 7200
 
 

@@ -1,0 +1,26 @@
+# Adds the on-prem Valkey to the demo stack as a third endpoint, with its own passwords.
+#   docker compose -f docker-compose.yml -f onprem.compose.yml --env-file onprem.env up -d --build
+x-admin-eps: &admin_eps aws=redis://default:adminpw@redis-aws:6379,gcp=redis://default:adminpw@redis-gcp:6379,onprem=redis://default:${VALKEY_ADMIN_PASSWORD}@redis-onprem:6379
+
+services:
+  redis-onprem:
+    extends:
+      file: ../onprem/docker-compose.yml
+      service: valkey
+
+  proxy:
+    environment:
+      STATEMIG_ENDPOINTS: aws=redis://app:apppw@redis-aws:6379,gcp=redis://app:apppw@redis-gcp:6379,onprem=redis://app:${VALKEY_APP_PASSWORD}@redis-onprem:6379
+    depends_on: [redis-onprem]
+
+  syncworker:
+    environment:
+      STATEMIG_ENDPOINTS: *admin_eps
+    depends_on: [redis-onprem]
+
+  statemig:
+    environment:
+      STATEMIG_ENDPOINTS: *admin_eps
+
+volumes:
+  valkey-data:

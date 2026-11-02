@@ -20,8 +20,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent))
-from scenario import (ADMIN, ADMIN_HEADERS, APP, COMPOSE_DIR, CTL, GROUPBUYS, absent, app_can_write,  # noqa: E402
-                      boundary_ok, deleted_probe, invariants, wait_processed)
+from scenario import (ADMIN, ADMIN_HEADERS, APP, COMPOSE_DIR, COMPOSE_FILES, CTL, GROUPBUYS, absent,  # noqa: E402
+                      app_can_write, boundary_ok, deleted_probe, invariants, wait_processed)
 
 LOADGEN = "http://localhost:18100"
 CLOSE_IN_S = 900               # keep q:delayed non-empty during the demo
@@ -150,7 +150,7 @@ def exclusive(name: str):
 
 
 def compose(*args):
-    p = subprocess.run(["docker", "compose", *args], cwd=COMPOSE_DIR, capture_output=True, text=True)
+    p = subprocess.run(["docker", "compose", *COMPOSE_FILES, *args], cwd=COMPOSE_DIR, capture_output=True, text=True)
     if p.returncode:
         raise HTTPException(500, p.stderr[-400:])
 
