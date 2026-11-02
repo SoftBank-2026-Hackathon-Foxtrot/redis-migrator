@@ -1,8 +1,8 @@
 """Demo console for a screen share (run on the host, next to docker compose).
 
 Runs the same steps and checks as scenario.py, one button at a time, and shows
-the proxy, the Sync Worker and both Redis instances live. The load itself comes
-from the loadgen container.
+the proxy, the Sync Worker and the three Redis instances (aws, onprem, gcp) live.
+The load itself comes from the loadgen container.
 
   python demo/console.py     # then open http://localhost:18888
 """
@@ -20,9 +20,10 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent))
-from scenario import (ADMIN, ADMIN_HEADERS, APP, COMPOSE_DIR, COMPOSE_FILES, CTL, GROUPBUYS, absent,  # noqa: E402
-                      app_can_write, boundary_ok, deleted_probe, invariants, wait_processed)
+from scenario import (ADMIN, ADMIN_HEADERS, APP, COMPOSE_DIR, COMPOSE_FILES, CTL, GROUPBUYS, ONPREM_FILES,  # noqa: E402
+                      absent, add_onprem, app_can_write, boundary_ok, deleted_probe, invariants, wait_processed)
 
+add_onprem()
 LOADGEN = "http://localhost:18100"
 CLOSE_IN_S = 900               # keep q:delayed non-empty during the demo
 CHART_SECONDS = 120
@@ -150,7 +151,8 @@ def exclusive(name: str):
 
 
 def compose(*args):
-    p = subprocess.run(["docker", "compose", *COMPOSE_FILES, *args], cwd=COMPOSE_DIR, capture_output=True, text=True)
+    p = subprocess.run(["docker", "compose", *COMPOSE_FILES, *ONPREM_FILES, *args], cwd=COMPOSE_DIR,
+                       capture_output=True, text=True)
     if p.returncode:
         raise HTTPException(500, p.stderr[-400:])
 
@@ -229,8 +231,8 @@ async def cutover():
     res = await control("POST", "/migrations/current/cutover", {"budget_ms": 3000})
     demo.probe_left, demo.probe_side = await absent(dst, demo.probe), dst
     fence = await app_can_write(src)
-    demo.windows.append({"label": f"{src} → {dst} 컷오버", "window": (res["switched_at"] - res["total_ms"] / 1000,
-                                                                     res["switched_at"]),
+    demo.windows.append({"label": f"{src} → {dst} 컷오버", "old": src,
+                         "window": (res["switched_at"] - res["total_ms"] / 1000, res["switched_at"]),
                          "paused_ms": res["paused_ms"]})
     demo.last_result = {"kind": "cutover", "src": src, "dst": dst, "probe": fence, **res}
     demo.note(f"컷오버 {src} → {dst}: 쓰기 정지 {res['paused_ms']:.0f}ms", "good", marker=True)
@@ -243,7 +245,7 @@ async def rollback_normal():
     m = demo.status["migration"]
     res = await control("POST", "/migrations/current/rollback", {"mode": "normal"})
     fence = await app_can_write(m["target"])
-    demo.windows.append({"label": f"{m['target']} → {m['source']} 정상 롤백",
+    demo.windows.append({"label": f"{m['target']} → {m['source']} 정상 롤백", "old": m["target"],
                          "window": (res["switched_at"] - res["total_ms"] / 1000, res["switched_at"]),
                          "paused_ms": res["paused_ms"]})
     demo.last_result = {"kind": "rollback", "src": m["target"], "dst": m["source"], "probe": fence, **res}
@@ -283,7 +285,7 @@ async def rollback_failure():
 @exclusive("대상 복구")
 async def recover():
     await asyncio.to_thread(compose, "start", f"redis-{demo.killed}")
-    demo.note(f"redis-{demo.killed} 재시작 (빈 상태)")
+    demo.note(f"redis-{demo.killed} 재시작 ({'AOF로 복구' if demo.killed == 'onprem' else '빈 상태'})")
     demo.killed = None
     return {"ok": True}
 
@@ -313,8 +315,8 @@ async def verify():
             row("요청 실패", failed == 0, f"{failed}건 / 전체 {ok_n + failed}건")
             row("세션 유실", lost == 0, f"{lost}건")
     active = demo.status.get("proxy", {}).get("active")
-    for side in ADMIN:
-        if side != active and demo.sides.get(side, {}).get("up") and demo.windows:
+    for side in ADMIN:     # only a side writes moved away from: one never used is not fenced
+        if side != active and demo.sides.get(side, {}).get("up") and any(w["old"] == side for w in demo.windows):
             fence = await app_can_write(side)
             row(f"구 Redis({side}) 쓰기 차단", fence == "NOPERM", f"앱 사용자로 쓰기 → {fence}")
     if demo.probe_left is not None:

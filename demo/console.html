@@ -115,7 +115,7 @@ th { color: var(--ink-2); font-weight: 600; }
 <div class="wrap">
   <header>
     <h1>Redis 무중단 이전</h1>
-    <small>로컬 환경: Valkey 컨테이너 2대가 AWS·GCP 역할, 원본 DB는 SQLite. 실제 클라우드가 아닙니다.</small>
+    <small>로컬 환경: Valkey 컨테이너 3대가 AWS·온프레·GCP 역할, 원본 DB는 SQLite. 실제 클라우드가 아닙니다.</small>
   </header>
 
   <section class="panel">
@@ -185,6 +185,7 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '
 const clock = t => new Date(t * 1000).toTimeString().slice(0, 8);
 const n0 = x => x == null ? '-' : Math.round(x).toLocaleString('ko-KR');
 let S = null, errMsg = '';
+const ROUTE = ['aws', 'onprem', 'gcp'];   // the demo's path, in order
 
 async function act(path, body) {
   errMsg = ''; $('err').textContent = '';
@@ -198,14 +199,15 @@ async function act(path, body) {
 
 function buttons(s) {
   const m = s.status.migration, px = s.status.proxy, st = m && m.state;
-  const active = px ? px.active : null, target = active === 'aws' ? 'gcp' : 'aws';
+  const active = px ? px.active : null, targets = ROUTE.filter(t => t !== active);
+  const nextTarget = ROUTE[ROUTE.indexOf(active) + 1];
   const seeded = !!px, loadOn = s.load.running, busy = !!s.busy;
   const canStart = seeded && (!m || ['ROLLED_BACK', 'COMMITTED', 'FAILED', 'ABORTED'].includes(st)) && !s.killed && px.active === px.consume;
   const hasLoadData = s.series.length > 0;
   const defs = [
     { label: '초기화', hint: '30초쯤', on: true, go: () => act('/api/reset'), key: 'reset' },
     { label: loadOn ? '부하 중지' : '부하 시작', hint: s.load.users ? `사용자 ${s.load.users}명` : '', on: seeded && !s.killed, go: () => act(loadOn ? '/api/load/stop' : '/api/load/start'), key: 'load' },
-    { label: `동기화 시작`, hint: active ? `${active} → ${target}` : '', on: canStart, go: () => act('/api/sync', { target }), key: 'sync' },
+    ...targets.map(target => ({ label: '동기화 시작', hint: active ? `${active} → ${target}` : '', on: canStart, go: () => act('/api/sync', { target }), key: `sync-${target}` })),
     { label: '컷오버', hint: s.ready ? '준비됨' : (st === 'SYNCING' ? '전체 비교 중' : ''), on: s.ready, go: () => act('/api/cutover'), key: 'cutover' },
     { sep: true },
     { label: '정상 롤백', hint: st === 'DRAINING' ? 'drain 뒤 가능' : '', on: st === 'CUTOVER' && !s.killed, go: () => act('/api/rollback/normal'), key: 'rb' },
@@ -222,7 +224,7 @@ function buttons(s) {
   if (!seeded) next = 'reset';
   else if (s.killed && ['CUTOVER', 'DRAINING'].includes(st)) next = 'frb';
   else if (!loadOn && !hasLoadData) next = 'load';
-  else if (canStart && !s.checks) next = !m ? 'sync' : null;
+  else if (canStart && !s.checks) next = nextTarget && (!m || st === 'COMMITTED') ? `sync-${nextTarget}` : null;
   else if (s.ready) next = 'cutover';
   const box = $('btns');
   const sig = JSON.stringify(defs.map(d => d.sep ? 0 : [d.label, d.hint, d.on && !busy, d.key === next]));
@@ -285,7 +287,7 @@ function sides(s) {
       <span>삭제 <b class="num">${n0(d.deleted)}</b></span>
       <span>방식 <b>${esc(d.copy_mode)}</b></span>`;
   }
-  const html = sideCard('aws', s) + `<div class="sync">${line}</div>` + sideCard('gcp', s);
+  const html = `<div class="sync">${line}</div>` + ROUTE.map(name => sideCard(name, s)).join('');
   const box = $('sides');
   if (box.dataset.h !== html) { box.dataset.h = html; box.innerHTML = html; }
 }

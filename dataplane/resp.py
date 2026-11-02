@@ -7,7 +7,7 @@ ReplyError instance for an error reply (raised by Conn.do, left in place in a pi
 import asyncio
 import socket
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import unquote, urlparse
 
 CRLF = b"\r\n"
@@ -126,9 +126,25 @@ class Endpoint:
     tls: bool
     username: str | None = None
     password: str | None = None
+    _lookup: asyncio.Future | None = field(default=None, init=False, repr=False)
 
     def public(self) -> dict:
         return {"name": self.name, "addr": f"{self.host}:{self.port}", "tls": self.tls}
+
+    async def _resolve(self) -> str:
+        """One lookup at a time per endpoint, shared by every dial. The event loop has few
+        resolver threads and a dead host's lookup holds one for seconds: without this, apps
+        dialing a dead Redis starve the lookups of the live one, even after a rollback."""
+        if self._lookup is None:
+            self._lookup = asyncio.ensure_future(
+                asyncio.get_running_loop().getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM))
+            self._lookup.add_done_callback(self._lookup_done)
+        return (await asyncio.shield(self._lookup))[0][4][0]
+
+    def _lookup_done(self, f: asyncio.Future) -> None:
+        self._lookup = None
+        if not f.cancelled():
+            f.exception()       # read here: every waiter may already have timed out
 
     async def dial(self, db: int = 0) -> "Conn":
         ctx = None
@@ -137,7 +153,9 @@ class Endpoint:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         async with asyncio.timeout(5):
-            r, w = await asyncio.open_connection(self.host, self.port, ssl=ctx, limit=READ_LIMIT)
+            addr = await self._resolve()
+            r, w = await asyncio.open_connection(addr, self.port, ssl=ctx, server_hostname=self.host if ctx else None,
+                                                 limit=READ_LIMIT)
             w.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             c = Conn(r, w)
             try:

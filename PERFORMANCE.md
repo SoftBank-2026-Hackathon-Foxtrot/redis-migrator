@@ -83,8 +83,8 @@ Python 프록시는 전환을 원자적으로 하려고 한 프로세스로 돌�
 
 | 검사 | Go | Python |
 |---|---|---|
-| `demo/faults.py` | 22/22 | 22/22 |
-| `demo/onprem_check.py` | 14/14 | 14/14 |
+| `demo/faults.py` | 23/23 | 23/23 |
+| `demo/onprem_check.py` | 15/15 | 15/15 |
 | `demo/chain_check.py` (aws → 온프레 → gcp) | 9/9 | 9/9 |
 | `demo/scenario.py --mode normal` | 통과 | 통과 |
 | `demo/scenario.py --mode failure` | 통과 | 통과 |
@@ -98,6 +98,7 @@ Python은 초당 약 3.5천 건에서 포화되니 그보다 충분히 낮게 �
 
 ## 한계
 
+- 위 성능 수치는 PAUSE 중 캐시 처리와 Python의 DNS 조회 수정 전에 쟀다. 정상 경로의 값이라 크게 다르지 않을 것으로 보지만 다시 재지는 않았다.
 - 실제 ElastiCache, Memorystore, VPN에서 잰 값이 아니다. 지연은 전달 프로그램으로 흉내 냈고, 대역폭 제한은 없다.
 - 지연 전달 프로그램은 두 버전 모두 Python(`dataplane/latency.py`)을 썼다.
 - 값이 작은 세션 키만 썼다. 큰 값에서는 차이가 달라질 수 있다.

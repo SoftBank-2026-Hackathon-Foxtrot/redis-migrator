@@ -15,13 +15,12 @@ import redis.asyncio as aioredis
 
 import scenario
 from faults import Ctl, report, results
-from scenario import APP, COMPOSE_DIR, COMPOSE_FILES, GROUPBUYS, Load, app_can_write, invariants, wait_processed
+from scenario import (APP, COMPOSE_DIR, COMPOSE_FILES, GROUPBUYS, ONPREM_FILES, Load, add_onprem, app_can_write,
+                      invariants, wait_processed)
 
-ONPREM_ADMIN = "redis://default:onprem-admin-pw@localhost:36379"
-scenario.ADMIN["onprem"] = ONPREM_ADMIN
-scenario.APPUSER["onprem"] = "redis://app:onprem-app-pw@localhost:36379"
+add_onprem()
 SENTINEL = "onprem:sentinel"     # outside the synced prefixes: only a restart can touch it
-COMPOSE = ["docker", "compose", *COMPOSE_FILES, "-f", "onprem.compose.yml", "--env-file", "onprem.env"]
+COMPOSE = ["docker", "compose", *COMPOSE_FILES, *ONPREM_FILES]
 
 
 def compose(*args):
@@ -141,6 +140,25 @@ async def case_restart_active(ctl: Ctl, load: Load, web: httpx.AsyncClient):
            r.status_code if r.status_code != 200 else f"쓰기 정지 {r.json().get('paused_ms')}ms")
 
 
+async def case_failure_rollback_after_delay(ctl: Ctl, load: Load):
+    """Apps keep dialing the dead Valkey until the rollback: the live side must be fine right after it."""
+    await ctl.sync_ready(target="onprem")
+    await ctl.post("/migrations/current/cutover", {"budget_ms": 3000})
+    await ctl.drained()
+    compose("kill", "redis-onprem")
+    await asyncio.sleep(5)
+    r = await ctl.post("/migrations/current/rollback", {"mode": "failure", "budget_ms": 2000})
+    t_rb = time.time()
+    await asyncio.sleep(10)
+    after = load.summary(t_rb + 0.5)
+    px = (await ctl.status())["proxy"]
+    report("죽은 온프레를 5초 방치 후 장애 롤백: 롤백 뒤 실패 없음",
+           r.status_code == 200 and px["active"] == "aws" and after["requests"] > 0 and after["failed"] == 0,
+           f"쓰기 정지 {r.json().get('paused_ms')}ms, 롤백 뒤 요청 {after['requests']}건 중 실패 {after['failed']}건, "
+           f"최대 {after['max_ms']}ms")
+    compose("start", "redis-onprem")
+
+
 async def main():
     print("fresh stack...", flush=True)
     compose("down", "-v", "--remove-orphans")
@@ -163,6 +181,7 @@ async def main():
         await case_precheck_and_cutover(ctl, load, web)
         await case_rollback_then_restart_fenced(ctl, load)
         await case_restart_active(ctl, load, web)
+        await case_failure_rollback_after_delay(ctl, load)
 
         load.stop.set()
         await runner

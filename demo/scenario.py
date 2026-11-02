@@ -30,7 +30,15 @@ APPUSER = {"aws": "redis://app:apppw@localhost:16379", "gcp": "redis://app:apppw
 COMPOSE_DIR = Path(__file__).parent
 GO_FILES = ["-f", "go.compose.yml"] if os.environ.get("DATAPLANE") == "go" else []
 COMPOSE_FILES = ["-f", "docker-compose.yml", *GO_FILES]
+ONPREM_FILES = ["-f", "onprem.compose.yml", "--env-file", "onprem.env"]
 GROUPBUYS = 10
+
+
+def add_onprem():
+    """For the scripts that run the stack with the on-prem Valkey as a third endpoint."""
+    # 127.0.0.1, not localhost: the port is bound to IPv4 only, and on Windows localhost tries IPv6 first
+    ADMIN["onprem"] = "redis://default:onprem-admin-pw@127.0.0.1:36379"
+    APPUSER["onprem"] = "redis://app:onprem-app-pw@127.0.0.1:36379"
 
 
 class Load:
