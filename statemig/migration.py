@@ -139,7 +139,7 @@ class Migration:
                 "record": self.record.read(), "events": self.events[-40:]}
 
     # ---- start ----------------------------------------------------------------------
-    async def precheck(self, budget_ms: int = 3000) -> dict:
+    async def precheck(self, budget_ms: int = 1800) -> dict:
         """Decided by what each Redis actually does, never by the name of the service."""
         src, dst = self.source.client(), self.target.client()
         r: dict = {"warnings": [], "errors": [], "fence": {}}
@@ -175,7 +175,7 @@ class Migration:
             await dst.aclose()
         return r
 
-    async def start(self, budget_ms: int = 3000) -> None:
+    async def start(self, budget_ms: int = 1800) -> None:
         async with self._lock:
             self.precheck_report = await self.precheck(budget_ms)
             self.fence_mode = self.precheck_report.get("fence", {})
@@ -215,7 +215,7 @@ class Migration:
         return self.mode != "delta" or st["sync"]["compare_valid"]
 
     # ---- cutover --------------------------------------------------------------------
-    async def cutover(self, budget_ms: int = 3000) -> dict:
+    async def cutover(self, budget_ms: int = 1800) -> dict:
         async with self._lock:
             if not await self.ready():
                 raise MigrationError(f"not ready (state={self.state})")
@@ -383,7 +383,7 @@ class Migration:
             await cli.aclose()
 
     # ---- rollback / commit ------------------------------------------------------------
-    async def rollback(self, mode: str = "normal", budget_ms: int = 3000) -> dict:
+    async def rollback(self, mode: str = "normal", budget_ms: int = 1800) -> dict:
         async with self._lock:
             if self.state not in ("CUTOVER", "DRAINING"):
                 raise MigrationError(f"rollback only after cutover (state={self.state})")

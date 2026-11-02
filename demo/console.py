@@ -228,7 +228,7 @@ async def cutover():
     src, dst = m["source"], m["target"]
     demo.probe = await deleted_probe(web)   # logged out before the cutover: must not reach the target
     await asyncio.sleep(1)
-    res = await control("POST", "/migrations/current/cutover", {"budget_ms": 3000})
+    res = await control("POST", "/migrations/current/cutover", {"budget_ms": 1800})
     demo.probe_left, demo.probe_side = await absent(dst, demo.probe), dst
     fence = await app_can_write(src)
     demo.windows.append({"label": f"{src} → {dst} 컷오버", "old": src,

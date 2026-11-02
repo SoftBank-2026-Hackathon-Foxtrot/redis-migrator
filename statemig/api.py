@@ -54,17 +54,17 @@ async def recover_saved_migration():
 
 class StartReq(BaseModel):
     target: str
-    budget_ms: int = 3000
+    budget_ms: int = 1800
     mode: str = "delta"    # delta | full
 
 
 class CutoverReq(BaseModel):
-    budget_ms: int = 3000
+    budget_ms: int = 1800
 
 
 class RollbackReq(BaseModel):
     mode: str = "normal"   # normal | failure
-    budget_ms: int = 3000
+    budget_ms: int = 1800
 
 
 def _need_current() -> Migration:

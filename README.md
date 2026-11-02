@@ -56,9 +56,9 @@ python demo/faults.py
 
 | 메서드 | 경로 | 설명 |
 |---|---|---|
-| POST | `/migrations` `{"target":"gcp","budget_ms":3000,"mode":"delta"}` | precheck(알림·권한 실측, 예상 시간), 대상 큐 group 생성, Sync Worker 시작. `delta`(기본)는 쓰기를 멈추기 전에 전체 비교, `full`은 쓰기 정지 안에서 전체 복사·비교 |
+| POST | `/migrations` `{"target":"gcp","budget_ms":1800,"mode":"delta"}` | precheck(알림·권한 실측, 예상 시간), 대상 큐 group 생성, Sync Worker 시작. `delta`(기본)는 쓰기를 멈추기 전에 전체 비교, `full`은 쓰기 정지 안에서 전체 복사·비교 |
 | GET | `/migrations/current/ready` | 동기화 backlog가 작아졌는지 |
-| POST | `/migrations/current/cutover` `{"budget_ms":3000}` | PAUSE → FINAL RECONCILE → VERIFY → SWITCH → FENCE → REVERSE SYNC → RESUME, 이후 큐 drain |
+| POST | `/migrations/current/cutover` `{"budget_ms":1800}` | PAUSE → FINAL RECONCILE → VERIFY → SWITCH → FENCE → REVERSE SYNC → RESUME, 이후 큐 drain |
 | POST | `/migrations/current/rollback` `{"mode":"normal"\|"failure"}` | 정상 롤백(대상 생존) / 장애 롤백(대상 소실) |
 | POST | `/migrations/current/commit` | 역방향 동기화 중지 |
 | GET | `/status` | 프록시, Sync Worker, 제어 레코드, 이벤트 |
