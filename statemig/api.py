@@ -12,6 +12,7 @@ import asyncio
 import hmac
 import logging
 import os
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -63,7 +64,7 @@ class CutoverReq(BaseModel):
 
 
 class RollbackReq(BaseModel):
-    mode: str = "normal"   # normal | failure
+    mode: Literal["normal", "failure"] = "normal"
     budget_ms: int = 1800
 
 
@@ -88,8 +89,7 @@ async def status():
             "migration": current.status() if current else None, "history": history[-10:]}
 
 
-@app.post("/migrations")
-async def start(req: StartReq):
+async def _new_migration(req: StartReq) -> Migration:
     global current
     if req.target not in ENDPOINTS:
         raise HTTPException(400, f"unknown endpoint {req.target}")
@@ -105,8 +105,14 @@ async def start(req: StartReq):
     if current:
         history.append(current.status())
     current = Migration(proxy, sync, record, ENDPOINTS[px["active"]], ENDPOINTS[req.target], APP_USER, store, req.mode)
-    await _run(current.start(req.budget_ms))
-    return current.status()
+    return current
+
+
+@app.post("/migrations")
+async def start(req: StartReq):
+    m = await _new_migration(req)
+    await _run(m.start(req.budget_ms))
+    return m.status()
 
 
 @app.get("/migrations/current/ready")
@@ -128,3 +134,75 @@ async def rollback(req: RollbackReq = RollbackReq()):
 async def commit():
     await _run(_need_current().commit())
     return current.status()
+
+
+# ---- common migration API, what the orchestrator calls --------------------------------
+# Long steps answer 202 at once. The orchestrator polls GET /v1/status.
+PHASES = {"PRECHECK": "preparing", "SYNCING": "preparing", "DRAINING": "executing", "CUTOVER": "executed",
+          "ROLLING_BACK_DRAIN": "rolling_back", "ROLLED_BACK": "rolled_back", "COMMITTED": "committed",
+          "ABORTED": "aborted", "FAILED": "failed"}
+RUNNING_PHASES = {"prepare": "preparing", "execute": "executing", "rollback": "rolling_back", "commit": "committing"}
+operation: dict | None = None
+operation_task: asyncio.Task | None = None
+
+
+async def _track(op: dict, coro):
+    try:
+        op["result"] = await coro
+        op["state"] = "succeeded"
+    except Exception as e:  # noqa: BLE001  reported through /v1/status
+        op["state"], op["error"] = "failed", str(e)
+
+
+def _begin(name: str, coro) -> dict:
+    global operation, operation_task
+    operation = {"name": name, "state": "running", "error": None, "result": None}
+    operation_task = asyncio.create_task(_track(operation, coro))
+    return {"operation": name, "state": "running"}
+
+
+def _need_idle():
+    if operation and operation["state"] == "running":
+        raise HTTPException(409, f"{operation['name']} is still running")
+
+
+@app.post("/v1/prepare", status_code=202)
+async def v1_prepare(req: StartReq):
+    _need_idle()
+    m = await _new_migration(req)
+    return _begin("prepare", m.start(req.budget_ms))
+
+
+@app.post("/v1/execute", status_code=202)
+async def v1_execute(req: CutoverReq = CutoverReq()):
+    _need_idle()
+    return _begin("execute", _need_current().cutover(req.budget_ms))
+
+
+@app.post("/v1/rollback", status_code=202)
+async def v1_rollback(req: RollbackReq = RollbackReq()):
+    _need_idle()
+    return _begin("rollback", _need_current().rollback(req.mode, req.budget_ms))
+
+
+@app.post("/v1/commit", status_code=202)
+async def v1_commit():
+    _need_idle()
+    return _begin("commit", _need_current().commit())
+
+
+@app.get("/v1/status")
+async def v1_status():
+    running = operation and operation["state"] == "running"
+    m = current
+    ready = False
+    if m and not running:
+        try:
+            ready = await m.ready()
+        except Exception:  # noqa: BLE001  the Sync Worker is down: not ready, and status still answers
+            pass
+    phase = RUNNING_PHASES[operation["name"]] if running else "ready" if ready else PHASES[m.state] if m else "idle"
+    return {"resource": "redis", "phase": phase, "ready": ready, "source": m.source.name if m else None,
+            "target": m.target.name if m else None, "active": (record.read() or {}).get("active"),
+            "operation": operation, "last_cutover": m.last_cutover if m else None,
+            "events": m.events[-20:] if m else []}
