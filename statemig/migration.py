@@ -1012,8 +1012,14 @@ async def _drop_prefix(ep: Endpoint, prefix: str) -> int:
     for db in dbs:
         c = ep.client(db)
         try:
+            batch = []      # a failure rollback does this with writes paused: one round trip per key adds up
             async for k in c.scan_iter(match=prefix + "*", count=1000):
-                n += await c.delete(k)
+                batch.append(k)
+                if len(batch) >= 1000:
+                    n += await c.unlink(*batch)
+                    batch.clear()
+            if batch:
+                n += await c.unlink(*batch)
         finally:
             await c.aclose()
     return n
