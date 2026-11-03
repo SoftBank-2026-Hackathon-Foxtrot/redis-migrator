@@ -350,9 +350,7 @@ class Migration:
                 raise MigrationError(f"verify failed: no queue group on {new.name}: {missing}")
             # PRESUBSCRIBE: every subscribed client gets the same subscriptions on the new side now,
             # while nothing is published; one that cannot calls the cutover off with nothing changed.
-            ps = await self.proxy.call("POST", "/presubscribe", {"target": new.name, "max_wait_ms": left()},
-                                       timeout=left() / 1000 + 1)
-            timings["presubscribed"] = ps["sessions"]
+            timings["presubscribed"] = await self._presubscribe(new, left)
             if spent() > budget_ms:     # the steps left are quick; past the budget, writes come first
                 raise MigrationError(f"budget exceeded: {round(spent())}ms > {budget_ms}ms before the switch")
         except (MigrationError, httpx.HTTPError) as e:
@@ -377,6 +375,19 @@ class Migration:
         timings["total_ms"] = round((time.monotonic() - t0) * 1000, 3)
         timings["switched_at"] = time.time()
         return timings
+
+    async def _presubscribe(self, new: Endpoint, left) -> int:
+        """A refusal calls the cutover off. An unreachable proxy is retried like the switch: one
+        that restarted has no subscribed session left, so there is nothing to lose by waiting."""
+        while True:
+            try:
+                ps = await self.proxy.call("POST", "/presubscribe", {"target": new.name, "max_wait_ms": left()},
+                                           timeout=left() / 1000 + 1)
+                return ps["sessions"]
+            except httpx.HTTPError:
+                if left() <= 100:
+                    raise
+                await asyncio.sleep(0.2)
 
     async def _finish_switch(self, old: Endpoint, new: Endpoint, gen: int, timings: dict, left):
         """Steps 4–7. Safe to run again: a restart converges by calling this once more."""
