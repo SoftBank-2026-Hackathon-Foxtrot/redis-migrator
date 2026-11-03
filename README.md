@@ -39,6 +39,7 @@ Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 �
 ```json
 {"workflowId":"wf-001","resourceId":"redis-main","kind":"REDIS","profile":"redis-proxy-sync-v1",
  "sourceRef":"resource:aws","targetRef":"resource:gcp","bindingRef":"binding:redis-proxy",
+ "workloadScopeRef":"workload:groupbuy-app",
  "policy":{"rollbackMode":"REVERSE_REQUIRED","maxQuiesceSeconds":1.8,"readyTimeoutSeconds":600}}
 ```
 

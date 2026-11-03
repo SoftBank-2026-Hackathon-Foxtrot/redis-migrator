@@ -28,7 +28,7 @@ def key() -> dict:
 def plan(**over) -> dict:
     return {"workflowId": "wf-001", "resourceId": "redis-main", "kind": "REDIS", "profile": "redis-proxy-sync-v1",
             "sourceRef": "resource:aws", "targetRef": "resource:gcp", "bindingRef": "binding:redis-proxy",
-            "policy": {"rollbackMode": "REVERSE_REQUIRED", "maxQuiesceSeconds": 1.8}, **over}
+            "workloadScopeRef": "workload:groupbuy-app", "policy": {"rollbackMode": "REVERSE_REQUIRED", "maxQuiesceSeconds": 1.8}, **over}
 
 
 def status(mid: str) -> dict:
@@ -70,8 +70,15 @@ def main():
 
     check("no token is refused", httpx.get("http://localhost:18090/v1/capabilities").status_code == 401)
     caps = API.get("/v1/capabilities").json()
-    check("capabilities list the profile", caps["profiles"][0]["profile"] == "redis-proxy-sync-v1"
-          and "resource:gcp" in caps["profiles"][0]["resources"])
+    prof = caps["profiles"][0]
+    check("capabilities follow the schema", caps.get("apiVersion") == "v1" and prof["profile"] == "redis-proxy-sync-v1"
+          and prof["kind"] == "REDIS" and set(prof) == {"kind", "profile", "sourceConditions", "targetConditions",
+                                                       "actions", "rollbackModes", "constraints"}
+          and any("resource:gcp" in c for c in prof["targetConditions"]), sorted(prof))
+    no_scope = {k: v for k, v in plan().items() if k != "workloadScopeRef"}
+    r = API.post("/v1/migrations", headers=key(), json=no_scope)
+    check("a plan without workloadScopeRef is refused", r.status_code == 400 and r.json()["code"] == "INVALID_REQUEST"
+          and set(r.json()) == {"code", "message", "operationId", "blockers"}, r.text[:200])
     check("a plan needs an Idempotency-Key", API.post("/v1/migrations", json=plan()).status_code == 400)
     r = API.post("/v1/migrations", headers=key(), json=plan(profile="nope"))
     check("an unknown profile is refused", r.status_code == 422 and r.json()["code"] == "UNSUPPORTED_PROFILE")
@@ -81,7 +88,8 @@ def main():
     k = key()
     r = API.post("/v1/migrations", headers=k, json=plan())
     mid = r.json()["migrationId"]
-    check("a plan answers 201 with a Location", r.status_code == 201 and r.headers["location"].endswith(mid))
+    check("a plan answers 201 with a Location and the whole Migration", r.status_code == 201
+          and r.headers["location"].endswith(mid) and r.json()["lifecycle"] == "CREATED" and "readiness" in r.json())
     again = API.post("/v1/migrations", headers=k, json=plan())
     check("the same key and body return the same plan", again.status_code == 201 and again.json()["migrationId"] == mid)
     r = API.post("/v1/migrations", headers=k, json=plan(workflowId="other"))
@@ -122,7 +130,13 @@ def main():
     op = act(mid, "CUTOVER", **TX)
     st = status(mid)
     check("CUTOVER reaches SWITCHED on the target", op["status"] == "SUCCEEDED" and st["lifecycle"] == "SWITCHED"
-          and st["observed"]["route"] == "TARGET" and st["observed"]["targetWritesPossible"], op["result"])
+          and st["observed"]["route"] == "TARGET" and st["observed"]["targetWritesPossible"], op["confirmedChanges"])
+    check("an operation follows the schema and lists what changed",
+          set(op) == {"operationId", "migrationId", "action", "status", "error", "confirmedChanges"}
+          and "route SOURCE -> TARGET" in op["confirmedChanges"], op["confirmedChanges"])
+    check("a status has only the schema's fields", "profile" not in st and set(st["details"]["redis"]) ==
+          {"dataRoute", "producerRoute", "consumerRoute", "sourceConsumerAccess", "drainStatus"}
+          and isinstance(st["topologyRevision"], int), sorted(st["details"]["redis"]))
     check("session survives the cutover", session_alive(sid))
     r = API.post(f"/v1/migrations/{mid}/actions", headers=key(),
                  json={"action": "RESUME", "expectedRevision": st["revision"], **TX, "expectedLocation": "SOURCE"})
@@ -142,7 +156,8 @@ def main():
         time.sleep(0.2)
     st = status(mid)
     check("details.redis follows the drain", st["details"]["redis"]["drainStatus"] == "SUCCEEDED"
-          and st["details"]["redis"]["consumerRoute"] == "TARGET")
+          and st["details"]["redis"]["consumerRoute"] == "TARGET"
+          and st["details"]["redis"]["sourceConsumerAccess"] == "BLOCKED", st["details"]["redis"])
     check("rollback is ready after the drain", st["readiness"]["rollback"]["result"] == "PASS"
           and st["rollback"]["method"] == "REVERSE_SYNC", st["readiness"]["rollback"])
 

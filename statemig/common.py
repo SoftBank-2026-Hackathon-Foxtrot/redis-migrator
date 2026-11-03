@@ -64,7 +64,7 @@ class CreateReq(BaseModel):
     sourceRef: str
     targetRef: str
     bindingRef: str
-    workloadScopeRef: str | None = None
+    workloadScopeRef: str
     policy: Policy = Policy()
 
 
@@ -120,7 +120,7 @@ class CommonApi:
         for op in self.data["operations"].values():
             if op["status"] in ("QUEUED", "RUNNING"):
                 op["status"] = "UNKNOWN"
-                op["error"] = {"code": "UNKNOWN_STATE", "message": "the adapter restarted during this command"}
+                op["error"] = self._op_error(op, "UNKNOWN_STATE", "the adapter restarted during this command")
                 self.data["migrations"][op["migrationId"]]["activeOperationId"] = None
                 self.data["migrations"][op["migrationId"]]["unknownOperationId"] = op["operationId"]
         self.store.save(self.data)
@@ -149,8 +149,13 @@ class CommonApi:
 
     # ---- plans -----------------------------------------------------------------------
     def capabilities(self) -> dict:
-        return {"kind": "REDIS", "profiles": [{
-            "profile": PROFILE, "resources": [f"resource:{n}" for n in self.endpoints], "bindings": [BINDING],
+        # What PREPARE refuses on either side, since each side is written by the sync in turn.
+        conditions = ["Redis 6+ or Valkey 7+, same family on both sides (DUMP/RESTORE, else per-type copy)",
+                      "single node or primary/replica: cluster mode off", "keyspace notifications on (KEA)",
+                      "maxmemory-policy noeviction when maxmemory is set",
+                      f"registered resource: {', '.join(f'resource:{n}' for n in self.endpoints)}"]
+        return {"apiVersion": "v1", "profiles": [{
+            "kind": "REDIS", "profile": PROFILE, "sourceConditions": conditions, "targetConditions": conditions,
             "actions": ACTIONS, "rollbackModes": ["REVERSE_REQUIRED"],
             "constraints": ["no Redis Cluster", "each db keeps its number; queues in db 0", "keyspace notifications required", "same engine family",
                             "QUIESCE checks only; CUTOVER holds, switches and resumes writes in one command",
@@ -229,20 +234,26 @@ class CommonApi:
     async def _execute(self, mig: dict, op: dict, req: ActionReq):
         op["status"] = "RUNNING"
         self.store.save(self.data)
+        before = await self._observe(mig)
         try:
             op["result"] = await getattr(self, f"_do_{req.action.lower()}")(mig, req)
             op["status"] = "SUCCEEDED"
         except MigrationError as e:
-            op["status"], op["error"] = "FAILED", {"code": "PRECONDITION_FAILED", "message": str(e)}
+            op["status"], op["error"] = "FAILED", self._op_error(op, "PRECONDITION_FAILED", str(e))
         except Refused as e:
-            op["status"], op["error"] = "FAILED", {"code": e.code, "message": e.message}
+            op["status"], op["error"] = "FAILED", self._op_error(op, e.code, e.message, e.blockers)
         except Exception as e:  # noqa: BLE001  a call that may or may not have taken effect
             log.exception("%s", req.action)
-            op["status"], op["error"] = "UNKNOWN", {"code": "UNKNOWN_STATE", "message": _why(e)}
+            op["status"], op["error"] = "UNKNOWN", self._op_error(op, "UNKNOWN_STATE", _why(e))
             mig["unknownOperationId"] = op["operationId"]
+        op["confirmedChanges"] = _changes(req.action, op, before, await self._observe(mig))
         mig["activeOperationId"] = None
         mig["revision"] += 1
         self.store.save(self.data)
+
+    @staticmethod
+    def _op_error(op: dict, code: str, message: str, blockers: list[str] | None = None) -> dict:
+        return {"code": code, "message": message, "operationId": op["operationId"], "blockers": blockers or []}
 
     def _budget_ms(self, mig: dict) -> int:
         return int(mig["policy"]["maxQuiesceSeconds"] * 1000)
@@ -275,6 +286,10 @@ class CommonApi:
         return {"checked": True, "writesHeld": False}
 
     async def _do_cutover(self, mig: dict, req: ActionReq) -> dict:
+        # The intent goes on record first: from here the target may take writes, even if the
+        # answer is lost. It never goes back to false for this plan.
+        mig["targetWritesPossible"] = True
+        self.store.save(self.data)
         res = await self._core(mig).cutover(self._budget_ms(mig))
         mig["cutOver"], mig["targetWritesPossible"] = True, True
         mig["lifecycle"] = "SWITCHED"
@@ -383,7 +398,7 @@ class CommonApi:
         else:
             drain = "RUNNING"
         return {"dataRoute": route, "producerRoute": route, "consumerRoute": consumer,
-                "sourceConsumerAccess": "READ_ACK_ONLY" if drain == "RUNNING" else "NONE", "drainStatus": drain}
+                "sourceConsumerAccess": _source_consumer_access(drain), "drainStatus": drain}
 
     def _check(self, mig: dict, code: str, stage: str, decision: dict, observed: dict) -> dict:
         at = observed["observedAt"]
@@ -391,7 +406,14 @@ class CommonApi:
         return {"code": code, "stage": stage, "required": True, "decision": decision,
                 "evidenceRef": f"evidence:{mig['migrationId']}:{code}:{at}", "observedAt": at,
                 "validUntil": until.replace("+00:00", "Z"), "transitionId": mig["transitionId"],
-                "topologyRevision": (observed.get("proxy") or {}).get("gen")}
+                "topologyRevision": self._topology(mig, observed)}
+
+    @staticmethod
+    def _topology(mig: dict, observed: dict) -> int:
+        """The proxy's route generation; the last one seen while the proxy does not answer."""
+        if (gen := (observed.get("proxy") or {}).get("gen")) is not None:
+            mig["topologyRevision"] = gen
+        return mig.get("topologyRevision") or 0
 
     async def view(self, migration_id: str) -> dict:
         mig = self._mig(migration_id)
@@ -466,17 +488,16 @@ class CommonApi:
         public_observed = {k: v for k, v in observed.items() if k != "proxy"}
         return {
             "migrationId": mig["migrationId"], "workflowId": mig["workflowId"], "resourceId": mig["resourceId"],
-            "kind": mig["kind"], "profile": mig["profile"], "revision": mig["revision"], "lifecycle": lifecycle,
+            "kind": mig["kind"], "revision": mig["revision"], "lifecycle": lifecycle,
             "health": health, "phase": f"redis.{core.state.lower()}" if core else "redis.none",
             "activeOperationId": mig["activeOperationId"], "transitionId": mig["transitionId"],
-            "transitionState": mig["transitionState"], "topologyRevision": (observed.get("proxy") or {}).get("gen"),
+            "transitionState": mig["transitionState"], "topologyRevision": self._topology(mig, observed),
             "allowedActions": allowed, "observed": public_observed,
             "readiness": {"cutover": cutover, "resume": resume, "rollback": rollback, "advance": advance},
             "rollback": {"method": method, "reasons": rollback["reasons"]},
             "progress": {"completed": None, "total": None, "unit": "keys"},
             "checks": checks,
-            "details": {"redis": {**details, "sync": sync_view or None,
-                                  "abortReason": core.abort_reason if core else None}},
+            "details": {"redis": details},
         }
 
     def tick(self):
@@ -507,6 +528,38 @@ class CommonApi:
         self.store.save(self.data)
 
 
+def _source_consumer_access(drain: str) -> str:
+    """Before the drain is done, consumers still read and ACK on the source. After it, the proxy
+    sends them to the target; the source is reached only through the proxy's credentials."""
+    return {"NOT_STARTED": "ALLOWED", "RUNNING": "ALLOWED", "SUCCEEDED": "BLOCKED"}.get(drain, "UNKNOWN")
+
+
+def _changes(action: str, op: dict, before: dict, after: dict) -> list[str]:
+    """The external changes this command is known to have made: what the proxy showed before and
+    after, and what the step itself reported. Nothing is listed for what was not seen."""
+    out = []
+    if before["route"] != after["route"]:
+        out.append(f"route {before['route']} -> {after['route']}")
+    b, a = before.get("proxy") or {}, after.get("proxy") or {}
+    if b.get("consume") and a.get("consume") and b["consume"] != a["consume"]:
+        out.append(f"queue consumers {b['consume']} -> {a['consume']}")
+    res = op.get("result") or {}
+    if op["status"] == "SUCCEEDED":
+        if action == "START_SYNC":
+            out.append("sync started; queue groups ensured on the target")
+        if res.get("fence"):
+            out.append(f"old side app writes fenced ({res['fence']})")
+        if res.get("paused_ms") is not None:
+            out.append(f"writes held {res['paused_ms']}ms, resumed on {after['route']}")
+        if res.get("cache_keys_dropped") is not None:
+            out.append(f"cache keys dropped on the source: {res['cache_keys_dropped']}")
+        if action in ("CANCEL", "FINALIZE"):
+            out.append("sync stopped")
+    elif action in ("CUTOVER", "ROLLBACK") and before["route"] == after["route"] and after["route"] != "UNKNOWN":
+        out.append(f"route unchanged ({after['route']})")
+    return out
+
+
 def build_router(api: CommonApi) -> APIRouter:
     router = APIRouter(prefix="/v1")
 
@@ -524,7 +577,7 @@ def build_router(api: CommonApi) -> APIRouter:
             mig = api.create(req)
         except Refused as e:
             return _error(e)
-        payload = {"migrationId": mig["migrationId"], "revision": mig["revision"], "lifecycle": mig["lifecycle"]}
+        payload = await api.view(mig["migrationId"])
         headers = {"Location": f"/v1/migrations/{mig['migrationId']}"}
         api.remember(record_key, body, 201, payload, headers)
         return JSONResponse(payload, status_code=201, headers=headers)
@@ -559,6 +612,7 @@ def build_router(api: CommonApi) -> APIRouter:
             return _error(Refused(404, "NOT_FOUND", f"no operation {operation_id}"))
         if op["status"] in ("QUEUED", "RUNNING"):
             response.headers["Retry-After"] = "1"
-        return op
+        return {"operationId": op["operationId"], "migrationId": op["migrationId"], "action": op["action"],
+                "status": op["status"], "error": op["error"], "confirmedChanges": op.get("confirmedChanges", [])}
 
     return router

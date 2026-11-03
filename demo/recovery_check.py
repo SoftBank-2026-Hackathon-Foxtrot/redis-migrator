@@ -425,7 +425,8 @@ def statemig_dies_in_abort():
 def adapter_dies_during_common_command():
     w = fresh()
     plan = {"workflowId": "wf", "resourceId": "redis", "kind": "REDIS", "profile": "redis-proxy-sync-v1",
-            "sourceRef": "resource:aws", "targetRef": "resource:gcp", "bindingRef": "binding:redis-proxy"}
+            "sourceRef": "resource:aws", "targetRef": "resource:gcp", "bindingRef": "binding:redis-proxy",
+            "workloadScopeRef": "workload:groupbuy-app"}
     tx = {"transitionId": "tx-1", "quiesceRef": "q:1"}
     key = lambda: {"Idempotency-Key": uuid.uuid4().hex}  # noqa: E731
     mid = API.post("/v1/migrations", headers=key(), json=plan).json()["migrationId"]

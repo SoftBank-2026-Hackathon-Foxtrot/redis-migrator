@@ -14,7 +14,10 @@ import logging
 import os
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .backend import Endpoint
@@ -44,6 +47,16 @@ def require_token(authorization: str = Header("")):
 
 
 app = FastAPI(title="statemig – Redis zero-downtime migration", dependencies=[Depends(require_token)])
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exc: RequestValidationError):
+    """The common API answers a malformed body with 400 INVALID_REQUEST in its error shape."""
+    if not request.url.path.startswith("/v1/"):
+        return await request_validation_exception_handler(request, exc)
+    fields = sorted({".".join(str(p) for p in e["loc"][1:]) for e in exc.errors()})
+    return JSONResponse({"code": "INVALID_REQUEST", "message": f"invalid or missing: {', '.join(fields)}",
+                         "operationId": None, "blockers": fields}, status_code=400)
 
 
 @app.on_event("startup")
