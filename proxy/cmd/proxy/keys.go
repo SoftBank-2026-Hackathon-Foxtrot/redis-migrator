@@ -46,29 +46,45 @@ var (
 	appDeniedCmds  = set("xgroup", "eval", "evalsha", "fcall", "script", "function")
 )
 
-// pausedCacheReply answers a cache command during PAUSE: a read is a miss and a
-// fill is dropped, since cache-aside refills from the DB. A fill held until RESUME
-// could land after the DEL of a commit made in the pause, and a read could return
-// what that DEL is waiting to remove. DEL itself stays held. nil = not answered here.
-func pausedCacheReply(name string, args [][]byte, resp3 bool) []byte {
-	if len(args) < 2 || !bytes.HasPrefix(args[1], []byte("cache:")) {
+const cachePrefix = "cache:"
+
+func isCacheKey(key []byte) bool { return bytes.HasPrefix(key, []byte(cachePrefix)) }
+
+func cacheMiss(resp3 bool) []byte {
+	if resp3 {
+		return []byte("_\r\n")
+	}
+	return []byte("$-1\r\n")
+}
+
+// cacheReply answers a cache command around a PAUSE. A read goes to Redis unless a write
+// to that key is being held: it would return what that write is about to change, so it
+// is a miss and cache-aside reads the DB. A fill is dropped, since one held until RESUME
+// could land after the DEL of a commit made in the pause. A key stays pending until its
+// held write has run, which can be just after RESUME. nil = not answered here.
+func cacheReply(name string, args [][]byte, resp3, paused bool, pending map[string]int) []byte {
+	if len(args) < 2 || !isCacheKey(args[1]) {
 		return nil
 	}
+	held := pending[string(args[1])] > 0
 	switch name {
 	case "get":
-		if resp3 {
-			return []byte("_\r\n")
+		if held {
+			return cacheMiss(resp3)
 		}
-		return []byte("$-1\r\n")
 	case "setex", "psetex":
-		return []byte("+OK\r\n")
+		if paused || held {
+			return []byte("+OK\r\n")
+		}
 	case "set":
 		for _, a := range args[min(3, len(args)):] {
 			if strings.EqualFold(string(a), "get") {
 				return nil
 			}
 		}
-		return []byte("+OK\r\n")
+		if paused || held {
+			return []byte("+OK\r\n")
+		}
 	}
 	return nil
 }

@@ -350,29 +350,40 @@ async def case_delta_silent_drift(ctl: Ctl):
 
 
 async def case_cache_during_pause(ctl: Ctl):
-    """A commit during PAUSE: its DEL is held. No fill may land after it, no read may see the old value."""
+    """A commit during PAUSE: its DEL is held. No fill may land after it, no read may see the old value.
+    Keys with no held write keep answering from Redis."""
     active = (await ctl.status())["proxy"]["active"]
     app_c = aioredis.from_url(PROXY_URL.format("app:app-proxy-pw@"), decode_responses=True)
     await app_c.set("cache:race:committed", "old", ex=60)
+    await app_c.set("cache:race:other", "kept", ex=60)
+    delete = None
     async with httpx.AsyncClient(base_url=PROXY_ADMIN, timeout=30, headers=ADMIN_HEADERS) as px:
         await px.post("/pause", json={"max_wait_ms": 1000})
         try:
-            read = await asyncio.wait_for(app_c.get("cache:race:committed"), 2)
+            before = await asyncio.wait_for(app_c.get("cache:race:committed"), 2)
             delete = asyncio.create_task(app_c.delete("cache:race:committed"))
-            await asyncio.sleep(0.1)
-            fill = asyncio.create_task(app_c.set("cache:race:committed", "stale", ex=60))
-            await asyncio.sleep(0.3)
+            read = before
+            for _ in range(200):    # the DEL takes a moment to reach the gate
+                read = await asyncio.wait_for(app_c.get("cache:race:committed"), 2)
+                if read is None:
+                    break
+                await asyncio.sleep(0.01)
+            other = await asyncio.wait_for(app_c.get("cache:race:other"), 2)
+            await asyncio.wait_for(app_c.set("cache:race:committed", "stale", ex=60), 2)    # answered, not held
+            await asyncio.wait_for(app_c.set("cache:race:other", "stale", ex=60), 2)
             del_held = not delete.done()
         finally:
             await px.post("/resume")
-    await asyncio.gather(fill, delete)
+    await delete
     await asyncio.sleep(0.2)
     await app_c.aclose()
     c = admin(active)
-    left = await c.get("cache:race:committed")
+    left, other_left = await c.get("cache:race:committed"), await c.get("cache:race:other")
+    await c.delete("cache:race:other")
     await c.aclose()
-    report("PAUSE 중 캐시: 읽기는 미스, 채우기는 버림, 삭제만 보류", read is None and del_held and left is None,
-           f"읽기={read}, 삭제 보류={del_held}, RESUME 뒤 값={left}")
+    report("PAUSE 중 캐시: 삭제 대기 키만 미스, 나머지는 응답, 채우기는 버림",
+           before == "old" and read is None and other == "kept" and del_held and left is None and other_left == "kept",
+           f"대기 전={before}, 대기 중={read}, 다른 키={other}, 삭제 보류={del_held}, RESUME 뒤={left}/{other_left}")
 
 
 async def case_poison_message(ctl: Ctl):

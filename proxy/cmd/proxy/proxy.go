@@ -58,6 +58,8 @@ type Proxy struct {
 	tx       int // sessions inside MULTI/WATCH
 	sessions map[*session]struct{}
 	blockCap int // ms; caps XREADGROUP BLOCK while consume != active
+	// cache keys with a write held at the gate and not finished yet, with how many
+	pendingCache map[string]int
 
 	upstreamTimeout time.Duration // per-command I/O deadline towards a backend
 
@@ -103,6 +105,7 @@ func NewProxy(route Route, paused bool, clients map[string]Client, backends []*r
 		return nil, err
 	}
 	p := &Proxy{clients: clients, cmds: ct, keys: kt, route: route, paused: paused, sessions: map[*session]struct{}{},
+		pendingCache: map[string]int{},
 		latency: newLatencyWindow(20000), blockCap: 200, upstreamTimeout: 3 * time.Second}
 	if paused {
 		p.pausedAt = time.Now()
@@ -139,18 +142,26 @@ func (p *Proxy) Route() (Route, bool) {
 // Queue consumer commands are neither held nor counted: SWITCH does not move
 // them (they stay on the consume backend until DRAIN_DONE), and a blocking
 // XREADGROUP would otherwise stretch every PAUSE up to its BLOCK timeout.
-// A cache command during PAUSE is answered here (the last result), under the same
-// lock, so a fill can't slip past the check and end up held instead of dropped.
-func (p *Proxy) enter(name string, args [][]byte, inTx, resp3 bool) (Route, uint64, bool, []byte) {
+// A cache command around a PAUSE may be answered here (the last result), under the same
+// lock, so a fill can't slip past the check and end up held instead of dropped. The third
+// last result lists the cache keys this command holds as pending; pass it back to exit.
+func (p *Proxy) enter(name string, args [][]byte, inTx, resp3 bool) (Route, uint64, bool, []byte, []string) {
 	held := !inTx && !consumeCmds[name] && p.cmds.Held(name)
 	p.mu.Lock()
-	if p.paused && !inTx {
-		if reply := pausedCacheReply(name, args, resp3); reply != nil {
+	if !inTx && (p.paused || len(p.pendingCache) > 0) {
+		if reply := cacheReply(name, args, resp3, p.paused, p.pendingCache); reply != nil {
 			p.mu.Unlock()
-			return Route{}, 0, false, reply
+			return Route{}, 0, false, reply, nil
 		}
 	}
+	var pending []string
 	if held && p.paused {
+		for _, k := range p.keys.keysOf(name, args) {
+			if isCacheKey(k) {
+				pending = append(pending, string(k))
+				p.pendingCache[string(k)]++
+			}
+		}
 		p.Stats.HeldCommands.Add(1)
 		for p.paused {
 			p.cond.Wait()
@@ -161,13 +172,18 @@ func (p *Proxy) enter(name string, args [][]byte, inTx, resp3 bool) (Route, uint
 	}
 	r, e := p.route, p.epoch
 	p.mu.Unlock()
-	return r, e, held, nil
+	return r, e, held, nil, pending
 }
 
-func (p *Proxy) exit(held bool, txDelta int) {
+func (p *Proxy) exit(held bool, txDelta int, pending []string) {
 	p.mu.Lock()
 	if held {
 		p.inflight--
+	}
+	for _, k := range pending {
+		if p.pendingCache[k]--; p.pendingCache[k] <= 0 {
+			delete(p.pendingCache, k)
+		}
 	}
 	p.tx += txDelta
 	if p.paused {
@@ -424,7 +440,7 @@ func (s *session) run() {
 
 		t0 := time.Now() // includes time at the gate: the pause shows up in latency honestly
 		wasTx := s.inTx()
-		route, epoch, held, answered := p.enter(name, args, wasTx, s.resp3())
+		route, epoch, held, answered, pending := p.enter(name, args, wasTx, s.resp3())
 		if answered != nil {
 			p.Stats.CacheBypassed.Add(1)
 			s.reply(answered)
@@ -445,6 +461,10 @@ func (s *session) run() {
 		if err != nil {
 			p.Stats.UpstreamErrors.Add(1)
 			buf = append(buf[:0], redisx.ErrorReply("ERR upstream unavailable: "+err.Error())...)
+			// A failure rollback pauses because this backend is dead: the cache is optional, the DB answers.
+			if _, paused := p.Route(); paused && name == "get" && len(args) > 1 && isCacheKey(args[1]) {
+				buf = append(buf[:0], cacheMiss(s.resp3())...)
+			}
 		}
 		s.track(name, args, buf, ep)
 		txDelta := 0
@@ -453,7 +473,7 @@ func (s *session) run() {
 		} else if wasTx && !s.inTx() {
 			txDelta = -1
 		}
-		p.exit(held, txDelta)
+		p.exit(held, txDelta, pending)
 
 		p.Stats.Commands.Add(1)
 		p.latency.add(time.Since(t0))
