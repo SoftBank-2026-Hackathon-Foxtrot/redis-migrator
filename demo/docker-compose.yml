@@ -1,6 +1,10 @@
 # Local stand-in for the verification scenario: ElastiCache (aws) → Memorystore (gcp),
 # both Valkey 8. Each Redis has two ACL users: default (migration/admin) and app
 # (what the proxy uses; fenced on the old side after a cutover).
+# Named on purpose: the default comes from the folder name, so another checkout's demo/ would
+# share this project, and the checks' `down -v` would delete its containers and volumes.
+name: foxtrot-redis-migrator
+
 x-valkey: &valkey
   image: valkey/valkey:8
   command: ["valkey-server", "--requirepass", "adminpw", "--user", "app", "on", ">apppw", "~*", "&*", "+@all"]
@@ -18,7 +22,7 @@ services:
 
   proxy:          # central RESP proxy on the management host (fixed address for every app)
     build: ../proxy
-    image: statemig-go
+    image: foxtrot-statemig-go
     entrypoint: ["statemig-proxy"]
     environment:
       STATEMIG_ENDPOINTS: aws=redis://app:apppw@redis-aws:6379,gcp=redis://app:apppw@redis-gcp:6379
@@ -32,7 +36,7 @@ services:
 
   syncworker:     # Sync Worker: notifications + scan copy, reverse sync after cutover
     build: ../proxy
-    image: statemig-go
+    image: foxtrot-statemig-go
     entrypoint: ["statemig-syncworker"]
     environment:
       STATEMIG_ENDPOINTS: *admin_eps
