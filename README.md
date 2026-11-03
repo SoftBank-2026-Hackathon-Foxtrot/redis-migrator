@@ -40,9 +40,12 @@ POST는 바로 `202`를 돌려주고 작업은 뒤에서 돈다. 결과는 `/v1/
   "active": "gcp",
   "operation": {"name": "execute", "state": "succeeded", "error": null, "result": {}},
   "last_cutover": {"paused_ms": 38.9, "total_ms": 42.1},
+  "sync": {"running": true, "halted": null, "backlog": 0, "lag_ms": 4, "changed_keys": 0, "error": null, "not_ready": null},
   "events": []
 }
 ```
+
+`sync`는 동기화 상태다. `lag_ms`는 원본에 쓴 표시 키의 알림이 돌아오기까지 걸린 시간, `changed_keys`는 다음 쓰기 정지에서 검증할 키 수, `not_ready`는 아직 `ready`가 아닌 이유다. `ready`는 `lag_ms`와 backlog를 복사하는 데 걸릴 시간이 각각 1초 이하인 상태가 3초 이어져야 켜진다. `halted`에 값이 있으면 재시작한 Redis가 데이터를 잃어 복사와 삭제를 멈춘 것이고, 그 Redis가 쓰기 대상이면 장애 롤백이나 commit 중에 사람이 고른다. `prepare` 전 단계라면 `prepare`로 다시 시작할 수 있다.
 
 | `phase` | 뜻 |
 |---|---|
@@ -65,6 +68,8 @@ POST는 바로 `202`를 돌려주고 작업은 뒤에서 돈다. 결과는 `/v1/
 | `422` | 본문 형식 오류 |
 
 단계 실패는 `operation.state`가 `failed`가 되고 `operation.error`에 이유가 남는다. 정상 롤백은 큐를 다 비운 `executed`부터 가능하다.
+
+statemig는 1초마다 멈춘 단계를 마무리하고, 프록시를 `control.json`에 맞추고, 재시작한 Sync Worker에 동기화를 다시 시작시킨다. 그래서 프로세스가 재시작한 뒤에는 `operation`이 `null`이어도 `phase`가 스스로 바뀐다. 오케스트레이터는 `phase`를 기준으로 판단한다.
 
 호출 순서:
 
@@ -107,6 +112,7 @@ cd demo && docker compose up -d --build
 | `python demo/scenario.py --mode normal` | 부하 중 컷오버, 롤백, commit |
 | `python demo/scenario.py --mode failure` | 대상 Redis 강제 종료 후 롤백 |
 | `python demo/faults.py` | 실패 경로와 권한 제한 |
+| `python demo/recovery_check.py` | Redis가 빈 채로 재시작, 프록시·Sync Worker·statemig가 전환 도중 사망 |
 | `python demo/onprem_check.py` | 온프레 Valkey 전환과 롤백 |
 | `python demo/chain_check.py` | aws → 온프레 → gcp 연속 이전 |
 | `python demo/aws_check.py` | 실제 ElastiCache. 같은 VPC의 호스트에서 실행 |

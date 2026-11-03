@@ -12,6 +12,8 @@
             failure = target is gone: switch back without reconcile, drop cache:*,
                       queues are rebuilt by the app's reconciler from the DB
   commit:   stop reverse sync; the old source can be decommissioned
+  watch:    once a second outside any step: finish a step left half done, put the proxy back on
+            the record, and pick the sync up again after a Sync Worker restart
 
 The data plane is Go: the central proxy and the Sync Worker. This module only
 decides *when* to do what. The control record (gen, active, consume, paused)
@@ -39,7 +41,9 @@ VERIFY_DELTA = {"mode": "delta", "sample": {"session:": 200, "cache:": 200, "q:d
 STREAMS = ["q:join", "q:notify"]
 GROUP = "workers"
 CONSUME_CMDS = "+xreadgroup +xack +xautoclaim +xclaim"
-READY_BACKLOG = 200
+READY_BACKLOG = 200             # what the precheck assumes is left at the pause
+READY_STABLE_MS = 3000          # how long the sync must have kept up before a cutover
+READY_VERIFY_MS = 1000          # the most a cutover may expect to spend comparing changed keys
 SYNC_WORKERS = 16               # the Sync Worker's default
 VERIFY_SAMPLE = 200
 COPY_BATCH = 100                # keys per round trip, per worker
@@ -47,6 +51,9 @@ VERIFY_BATCH = 200              # keys per round trip
 SCAN_COUNT = 10000
 PROBE_KEY = b"__statemig:probe"
 PROBE_USER = "__statemig_probe"
+STALE_PROXY_S = 3               # the proxy may differ from the record this long before it is repaired
+SYNC_RETRY_S = 5
+FAILURE_STATUS_TIMEOUT_S = 1    # the target is dead: a hung Sync Worker must not hold up the rollback
 
 
 class MigrationError(Exception):
@@ -112,7 +119,15 @@ class Migration:
         self.events: list[dict] = []
         self.drain_task: asyncio.Task | None = None
         self.fence_task: asyncio.Task | None = None
+        self.sync_error: str | None = None      # why the sync could not be picked up again
+        self._sync_retry_at = 0.0
+        self._stale_since: float | None = None
+        self._watch_error: str | None = None
         self._lock = asyncio.Lock()
+
+    def retire(self):
+        """A newer migration replaces this one: its background loops end, its saved file is reused."""
+        self._state = "REPLACED"
 
     @property
     def state(self) -> str:
@@ -200,7 +215,7 @@ class Migration:
         while self.state in ("SYNCING", "DRAINING", "CUTOVER"):
             try:
                 st = (await self.sync.call("GET", "/status")).get("sync", {})
-                if st and not st["compare_valid"] and not st["comparing"]:
+                if st and not st.get("halted") and not st["compare_valid"] and not st["comparing"]:
                     res = await self.sync.call("POST", "/precompare", {"deadline_ms": 3_600_000}, timeout=3700)
                     self._event("precompare done", **res)
             except Exception as e:  # noqa: BLE001
@@ -208,17 +223,33 @@ class Migration:
             await asyncio.sleep(1)
         self.compare_task = None
 
+    async def not_ready(self) -> str | None:
+        """Why a cutover should not start now, or None. Lag is judged in time, not in keys:
+        a high write rate always has keys on the way, however healthy the sync is."""
+        st = await self.sync.call("GET", "/status", timeout=2)
+        s = st.get("sync") or {}
+        if self.state != "SYNCING":
+            return f"state={self.state}"
+        if not st.get("running"):
+            return "no sync running"
+        if s.get("halted"):
+            return f"sync halted: {s['halted']}"
+        if self.mode == "delta" and not s["compare_valid"]:
+            return "full compare not finished"
+        if s["stable_ms"] < READY_STABLE_MS:
+            return f"sync not keeping up for {READY_STABLE_MS}ms yet (lag {s['lag_ms']}ms, backlog {s['backlog']})"
+        if s["est_verify_ms"] > READY_VERIFY_MS:
+            return f"{s['delta_keys']} changed keys still to compare (about {s['est_verify_ms']}ms)"
+        return None
+
     async def ready(self) -> bool:
-        st = await self.sync.call("GET", "/status")
-        if self.state != "SYNCING" or not st.get("running") or st["sync"]["backlog"] >= READY_BACKLOG:
-            return False
-        return self.mode != "delta" or st["sync"]["compare_valid"]
+        return await self.not_ready() is None
 
     # ---- cutover --------------------------------------------------------------------
     async def cutover(self, budget_ms: int = 1800) -> dict:
         async with self._lock:
-            if not await self.ready():
-                raise MigrationError(f"not ready (state={self.state})")
+            if why := await self.not_ready():
+                raise MigrationError(f"not ready ({why})")
             res = await self._switch_over(self.source, self.target, budget_ms, "cutover")
             self._after_switch(res, "cutover")
             return res
@@ -235,15 +266,31 @@ class Migration:
             self._event("normal rollback done", **res)
             self.drain_task = asyncio.create_task(self._drain(self.target, res["gen"], "ROLLED_BACK"))
 
+    async def _before_pause(self, budget_ms: int):
+        """What can be judged while writes still flow, so a hopeless cutover costs no pause."""
+        try:
+            st = (await self.sync.call("GET", "/status", timeout=5)).get("sync") or {}
+            if st.get("est_verify_ms", 0) > budget_ms:
+                raise MigrationError(f"not started: comparing {st['delta_keys']} changed keys would take "
+                                     f"{st['est_verify_ms']}ms, budget {budget_ms}ms")
+            c = await self.sync.call("POST", "/verify", {"mode": "count", "sample": VERIFY_DELTA["sample"]}, timeout=300)
+        except httpx.HTTPError as e:
+            raise MigrationError(f"not started: {_why(e)}") from e
+        if not c["ok"]:
+            raise MigrationError(f"verify failed: {c['prefixes']}")
+
     async def _switch_over(self, old: Endpoint, new: Endpoint, budget_ms: int, kind: str) -> dict:
         """PAUSE … RESUME, shared by cutover and normal rollback."""
+        if self.mode == "delta":
+            await self._before_pause(budget_ms)
         t0 = time.monotonic()
-        left = lambda: max(100, int(budget_ms - (time.monotonic() - t0) * 1000))  # noqa: E731
+        spent = lambda: (time.monotonic() - t0) * 1000  # noqa: E731
+        left = lambda: max(100, int(budget_ms - spent()))  # noqa: E731
         rec = self.record.read()
         timings: dict = {}
 
         # 1. PAUSE
-        self.switching = {"old": old.name, "new": new.name, "kind": kind}
+        self.switching = {"old": old.name, "new": new.name, "kind": kind, "gen0": rec["gen"]}
         self.record.write(**{**rec, "paused": True})
         self._save()
         try:
@@ -251,19 +298,25 @@ class Migration:
             timings["pause_wait_ms"] = p["waited_ms"]
             # 2. FINAL RECONCILE
             rc = await self.sync.call("POST", "/reconcile", {"deadline_ms": left(), "mode": self.mode},
-                                      timeout=left() / 1000 + 5)
+                                      timeout=left() / 1000 + 1)
             timings["reconcile_ms"], timings["reconciled_keys"] = rc["ms"], rc["scanned"]
             # 3. VERIFY
-            v = await self.sync.call("POST", "/verify", VERIFY_DELTA if self.mode == "delta" else VERIFY,
-                                     timeout=left() / 1000 + 5)
+            v = await self.sync.call("POST", "/verify",
+                                     {**(VERIFY_DELTA if self.mode == "delta" else VERIFY), "deadline_ms": left()},
+                                     timeout=left() / 1000 + 1)
             timings["verify_ms"] = v["ms"]
             if not v["ok"]:
                 raise MigrationError(f"verify failed: {v['prefixes']}")
             if missing := await _missing_groups(new):
                 raise MigrationError(f"verify failed: no queue group on {new.name}: {missing}")
+            if spent() > budget_ms:     # the steps left are quick; past the budget, writes come first
+                raise MigrationError(f"budget exceeded: {round(spent())}ms > {budget_ms}ms before the switch")
         except (MigrationError, httpx.HTTPError) as e:
-            await self._abort(rec, str(e))
-            raise MigrationError(str(e)) from e
+            try:
+                await self._abort(rec, str(e))
+            except Exception as e2:  # noqa: BLE001  switching stays set: the watch finishes it
+                self._event("abort unfinished, the watch retries", error=_why(e2))
+            raise MigrationError(_why(e)) from e
 
         # 4. SWITCH: record first; from here on forward, or a full revert
         gen = rec["gen"] + 1
@@ -271,8 +324,12 @@ class Migration:
         try:
             await self._finish_switch(old, new, gen, timings, left)
         except Exception as e:  # noqa: BLE001
-            await self._revert(old, new, gen, kind, str(e))
-            raise MigrationError(f"switch reverted to {old.name}: {e}") from e
+            try:
+                await self._revert(old, new, gen, kind, _why(e))
+            except Exception as e2:  # noqa: BLE001  switching stays set: the watch finishes it
+                self._event("revert unfinished, the watch retries", error=_why(e2))
+                raise MigrationError(f"switch reverting to {old.name}: {_why(e)}") from e
+            raise MigrationError(f"switch reverted to {old.name}: {_why(e)}") from e
         timings["total_ms"] = round((time.monotonic() - t0) * 1000, 3)
         timings["switched_at"] = time.time()
         return timings
@@ -284,9 +341,14 @@ class Migration:
                 await self.proxy.call("POST", "/switch", {"gen": gen})
                 break
             except Exception as e:  # noqa: BLE001
-                st = (await self.proxy.call("GET", "/status"))["proxy"]
-                if st["gen"] == gen:   # applied, only the reply was lost
-                    break
+                try:
+                    st = (await self.proxy.call("GET", "/status"))["proxy"]
+                    if st["gen"] == gen:   # applied, only the reply was lost
+                        break
+                    if not st["paused"]:    # it restarted before the record said paused
+                        await self._close_gate()
+                except Exception:  # noqa: BLE001  still down
+                    pass
                 if left() <= 100:
                     raise MigrationError(f"switch to gen {gen} not applied: {e}") from e
                 await asyncio.sleep(0.2)
@@ -300,9 +362,13 @@ class Migration:
         if st["gen"] != gen or st["active"] != new.name:
             raise MigrationError(f"proxy not on recorded gen {gen}: {st}")
         self.record.write(gen=gen, active=new.name, consume=old.name, paused=False)
-        r = await self.proxy.call("POST", "/resume")
-        timings["paused_ms"] = r["paused_ms"]
         timings["gen"] = gen
+        try:
+            r = await self.proxy.call("POST", "/resume")
+            timings["paused_ms"] = r["paused_ms"]
+        except Exception as e:  # noqa: BLE001  the record already says resumed: no way back from here
+            timings["paused_ms"] = None    # a restarted proxy starts unpaused, the watch covers the rest
+            self._event("resume unanswered, going forward", error=_why(e))
 
     async def _fence_old(self, old: Endpoint) -> str:
         """A failed fence does not stop the switch: only the proxy holds the credentials."""
@@ -335,9 +401,13 @@ class Migration:
         """Nothing reached the new side yet (no RESUME), so going back loses nothing."""
         back = gen + 1
         self.record.write(gen=back, active=old.name, consume=old.name, paused=True)
+        await self._finish_revert(old, new, back, kind, reason)
+
+    async def _finish_revert(self, old: Endpoint, new: Endpoint, back: int, kind: str, reason: str):
+        """Safe to run again: the record already says where this ends."""
         if self.fence_task:
             self.fence_task.cancel()
-        await self.proxy.call("POST", "/switch", {"gen": back})
+        await self._apply_route(back)
         await self._set_write(old, True)
         self.record.write(gen=back, active=old.name, consume=old.name, paused=False)
         await self.proxy.call("POST", "/resume")
@@ -350,6 +420,20 @@ class Migration:
             self.state = "CUTOVER"
             asyncio.create_task(self._restore_direction(old, new))
 
+    async def _close_gate(self):
+        """Only closes it: SWITCH needs the gate shut, not the writes in flight finished."""
+        try:
+            await self.proxy.call("POST", "/pause", {"max_wait_ms": 1})
+        except MigrationError:
+            pass
+
+    async def _apply_route(self, gen: int):
+        """Puts the proxy on the generation in the record."""
+        st = (await self.proxy.call("GET", "/status"))["proxy"]
+        if st["gen"] < gen:
+            await self._close_gate()
+            await self.proxy.call("POST", "/switch", {"gen": gen})
+
     async def _restore_direction(self, active: Endpoint, other: Endpoint):
         try:
             await self._set_write(other, False)
@@ -359,10 +443,10 @@ class Migration:
 
     async def _abort(self, rec: dict, reason: str):
         self.record.write(**{**rec, "paused": False})
-        await self.proxy.call("POST", "/resume")
+        r = await self.proxy.call("POST", "/resume")
         self.switching = None
         self._save()
-        self._event("cutover aborted, old side still active", reason=reason)
+        self._event("cutover aborted, old side still active", reason=reason, paused_ms=r["paused_ms"])
 
     async def _drain(self, old: Endpoint, gen: int, final_state: str):
         """QUEUE DRAIN: once the old side's queues are empty, consumers follow the writers."""
@@ -396,24 +480,35 @@ class Migration:
             return await self._failure_rollback(budget_ms)
 
     async def _failure_rollback(self, budget_ms: int) -> dict:
-        """Target Redis is gone. Loss = what the reverse sync had not copied yet."""
+        """Target Redis is gone. Loss = what the reverse sync had not copied yet.
+        Safe to run again: a restart or the watch finishes it from the saved switching."""
         t0 = time.monotonic()
         res: dict = {"mode": "failure"}
+        self.switching = {"old": self.target.name, "new": self.source.name, "kind": "failure"}
+        self._save()
         try:
-            st = (await self.sync.call("GET", "/status")).get("sync", {})
-            res["reverse_backlog_at_failure"] = st.get("backlog")
-            res["reverse_oldest_dirty_age_ms"] = st.get("oldest_dirty_age_ms")
+            status = await self.sync.call("GET", "/status", timeout=FAILURE_STATUS_TIMEOUT_S)
+            st = status.get("sync", {})
+            if not status.get("running"):
+                res["reverse_backlog_at_failure"] = "unknown: no sync running"
+            elif st.get("halted"):
+                res["reverse_backlog_at_failure"] = f"unknown: sync halted: {st['halted']}"
+            else:
+                res["reverse_backlog_at_failure"] = st.get("backlog")
+                res["reverse_oldest_dirty_age_ms"] = st.get("oldest_dirty_age_ms")
         except Exception as e:  # noqa: BLE001
-            res["reverse_backlog_at_failure"] = f"unknown: {e}"
+            res["reverse_backlog_at_failure"] = f"unknown: {_why(e)}"
         rec = self.record.read()
-        self.record.write(**{**rec, "paused": True})
-        try:   # writes in flight to the dead backend fail on their own: do not wait for them
-            await self.proxy.call("POST", "/pause", {"max_wait_ms": min(budget_ms, 300)})
-        except MigrationError as e:
-            res["pause_note"] = str(e)
-        gen = rec["gen"] + 1
+        gen = rec["gen"]
+        if rec["active"] != self.source.name:
+            self.record.write(**{**rec, "paused": True})
+            try:   # writes in flight to the dead backend fail on their own: do not wait for them
+                await self.proxy.call("POST", "/pause", {"max_wait_ms": min(budget_ms, 300)})
+            except MigrationError as e:
+                res["pause_note"] = str(e)
+            gen += 1
         self.record.write(gen=gen, active=self.source.name, consume=self.source.name, paused=True)
-        await self.proxy.call("POST", "/switch", {"gen": gen})
+        await self._apply_route(gen)
         await self._set_write(self.source, True)
         res["cache_keys_dropped"] = await _drop_prefix(self.source, "cache:")
         self.record.write(gen=gen, active=self.source.name, consume=self.source.name, paused=False)
@@ -423,6 +518,7 @@ class Migration:
         # outside the pause: its workers may still be timing out against the dead target
         asyncio.create_task(self._stop_sync_quietly())
         res.update(gen=gen, paused_ms=r["paused_ms"], total_ms=round((time.monotonic() - t0) * 1000, 3))
+        self.switching = None
         self.state = "ROLLED_BACK"
         self._event("failure rollback done", **res)
         return res
@@ -463,30 +559,119 @@ class Migration:
         async with self._lock:
             for attempt in range(60):
                 try:
-                    px = (await self.proxy.call("GET", "/status"))["proxy"]
-                    await self.sync.call("GET", "/status")
+                    await self.proxy.call("GET", "/status")
                     break
                 except Exception:  # noqa: BLE001  the proxy may be restarting too
                     if attempt == 59:
                         raise
                     await asyncio.sleep(1)
-            rec = self.record.read()
-            sw = self.switching
-            self._event("restarted", state=self.state, switching=sw, record=rec)
-            if sw and rec["active"] == sw["new"]:   # gen N+1 is recorded: finish going forward
-                await self._recover_forward(sw, rec)
-            elif sw:                                  # not recorded: as if it never happened
-                await self.proxy.call("POST", "/pause", {"max_wait_ms": 1000})
-                await self._abort(rec, "restarted before the switch was recorded")
-            elif rec["paused"] or px["paused"]:
+            await self._converge()
+
+    async def _converge(self):
+        rec = self.record.read()
+        sw = self.switching
+        self._event("recovering", state=self.state, switching=sw, record=rec)
+        if sw and sw["kind"] == "failure":        # the decision was made: the target is gone
+            await self._failure_rollback(1800)
+        elif sw and rec["active"] == sw["new"]:   # gen N+1 is recorded: finish going forward
+            await self._recover_forward(sw, rec)
+        elif sw:                                  # not recorded, or already going back
+            await self._recover_back(sw, rec)
+        else:
+            await self._apply_route(rec["gen"])
+            px = (await self.proxy.call("GET", "/status"))["proxy"]
+            if rec["paused"] or px["paused"]:
                 self.record.write(**{**rec, "paused": False})
                 await self.proxy.call("POST", "/resume")
-            rec = self.record.read()
-            self._watch_compare()
+        rec = self.record.read()
+        self._watch_compare()
+        if not self.drain_task or self.drain_task.done():
             if self.state == "DRAINING":
                 self.drain_task = asyncio.create_task(self._drain(self.source, rec["gen"], "CUTOVER"))
             elif self.state == "ROLLING_BACK_DRAIN":
                 self.drain_task = asyncio.create_task(self._drain(self.target, rec["gen"], "ROLLED_BACK"))
+        if self.state == "ROLLED_BACK":     # a failure rollback that died before stopping the sync
+            st = await self.sync.call("GET", "/status", timeout=2)
+            if st.get("running") and st["sync"]["src"] != rec["active"]:
+                await self._stop_sync_quietly()
+
+    async def _recover_back(self, sw: dict, rec: dict):
+        eps = {self.source.name: self.source, self.target.name: self.target}
+        old, new = eps[sw["old"]], eps[sw["new"]]
+        if rec["gen"] > sw.get("gen0", rec["gen"]):    # a revert got as far as the record
+            await self._finish_revert(old, new, rec["gen"], sw["kind"], "finished after a restart")
+        else:
+            await self._abort(rec, "restarted before the switch was recorded")
+
+    # ---- watch ----------------------------------------------------------------------
+    async def watch_once(self):
+        """Outside any step (they hold the lock), the record must describe what is running."""
+        if self._lock.locked():
+            return
+        try:
+            px = (await self.proxy.call("GET", "/status", timeout=2))["proxy"]
+        except Exception:  # noqa: BLE001  down: a restart reads the record, then this repairs the rest
+            return
+        rec = self.record.read()
+        if not rec:
+            return
+        stale = (px["gen"] < rec["gen"] or (px["gen"] == rec["gen"] and px["active"] != rec["active"])
+                 or px["paused"] or rec["paused"])
+        self._stale_since = (self._stale_since or time.monotonic()) if stale else None
+        if self.switching or (stale and time.monotonic() - self._stale_since >= STALE_PROXY_S):
+            try:
+                await self.recover()
+                self._watch_error, self._stale_since = None, None
+            except Exception as e:  # noqa: BLE001
+                if _why(e) != self._watch_error:
+                    self._watch_error = _why(e)
+                    self._event("repair failed, retrying", error=_why(e))
+                return
+        await self._ensure_sync()
+
+    async def _ensure_sync(self):
+        """The Sync Worker keeps nothing across a restart: start it again in the right direction."""
+        if self.state == "SYNCING":
+            src, dst = self.source, self.target
+        elif self.state in ("DRAINING", "CUTOVER"):
+            src, dst = self.target, self.source
+        else:
+            return
+        try:
+            if (await self.sync.call("GET", "/status", timeout=2)).get("running"):
+                self.sync_error = None
+                return
+        except Exception:  # noqa: BLE001
+            return
+        if time.monotonic() < self._sync_retry_at:
+            return
+        async with self._lock:
+            if self.switching:
+                return
+            try:
+                await self.sync.call("POST", "/start", {"src": src.name, "dst": dst.name, "include": SYNC_PREFIXES,
+                                                       "expect_synced": True}, timeout=SYNC_RETRY_S + 1)
+                self.sync_error = None
+                self._event("sync picked up again after a Sync Worker restart", src=src.name, dst=dst.name)
+                self._watch_compare()
+            except Exception as e:  # noqa: BLE001
+                self._sync_retry_at = time.monotonic() + SYNC_RETRY_S
+                if _why(e) != self.sync_error:
+                    self.sync_error = _why(e)
+                    self._event("could not pick the sync up again", error=_why(e))
+
+    async def sync_view(self) -> dict:
+        """What the orchestrator needs to see: is anything copying right now?"""
+        try:
+            st = await self.sync.call("GET", "/status", timeout=1)
+            not_ready = await self.not_ready() if self.state == "SYNCING" else None
+        except Exception as e:  # noqa: BLE001
+            return {"running": False, "halted": None, "backlog": None, "lag_ms": None, "changed_keys": None,
+                    "error": f"unreachable: {_why(e)}", "not_ready": "Sync Worker unreachable"}
+        s = st.get("sync") or {}
+        return {"running": bool(st.get("running")), "halted": s.get("halted") or None, "backlog": s.get("backlog"),
+                "lag_ms": s.get("lag_ms"), "changed_keys": s.get("delta_keys"), "error": self.sync_error,
+                "not_ready": not_ready}
 
     async def _recover_forward(self, sw: dict, rec: dict):
         eps = {self.source.name: self.source, self.target.name: self.target}
@@ -521,6 +706,11 @@ class Migration:
                     raise
         finally:
             await c.aclose()
+
+
+def _why(e: Exception) -> str:
+    """httpx timeouts have an empty message."""
+    return str(e) or type(e).__name__
 
 
 def _version(info: dict) -> str:
@@ -607,7 +797,7 @@ async def _estimate(src, dst, budget_ms: int, mode: str) -> dict:
     if mode == "delta":     # what is left at the pause, a sample per prefix, and counting keys
         left, sampled = READY_BACKLOG, min(keys, VERIFY_SAMPLE * len(SYNC_PREFIXES))
         copy_ms = left / COPY_BATCH * (rs + rd) / SYNC_WORKERS
-        verify_ms = ((left + sampled) / VERIFY_BATCH + keys / SCAN_COUNT + len(SYNC_PREFIXES)) * (rs + rd)
+        verify_ms = ((left + sampled) / VERIFY_BATCH + len(SYNC_PREFIXES)) * (rs + rd)  # key counts: before the pause
     else:
         copy_ms = keys / COPY_BATCH * (rs + rd) / SYNC_WORKERS
         compared = counts["session:"] + counts["q:delayed"] + min(counts["cache:"], VERIFY_SAMPLE)

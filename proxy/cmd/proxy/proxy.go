@@ -77,15 +77,30 @@ type ProxyStats struct {
 	MaxPauseMs     atomic.Value
 }
 
-func NewProxy(route Route, paused bool, clients map[string]Client) (*Proxy, error) {
-	c, err := route.Active.Dial(0)
-	if err != nil {
-		return nil, fmt.Errorf("connect %s: %w", route.Active.Name, err)
+// loadTables reads the command table from the first backend that answers: a dead
+// active backend must not keep the proxy down, or nothing could roll back from it.
+func loadTables(eps []*redisx.Endpoint) (CmdTable, KeyTable, error) {
+	var err error
+	for _, ep := range eps {
+		var c *redisx.Conn
+		if c, err = ep.Dial(0); err != nil {
+			err = fmt.Errorf("connect %s: %w", ep.Name, err)
+			continue
+		}
+		ct, kt, e := LoadCmdTable(c)
+		c.Close()
+		if e == nil {
+			return ct, kt, nil
+		}
+		err = fmt.Errorf("COMMAND on %s: %w", ep.Name, e)
 	}
-	ct, kt, err := LoadCmdTable(c)
-	c.Close()
+	return nil, nil, err
+}
+
+func NewProxy(route Route, paused bool, clients map[string]Client, backends []*redisx.Endpoint) (*Proxy, error) {
+	ct, kt, err := loadTables(backends)
 	if err != nil {
-		return nil, fmt.Errorf("COMMAND on %s: %w", route.Active.Name, err)
+		return nil, err
 	}
 	p := &Proxy{clients: clients, cmds: ct, keys: kt, route: route, paused: paused, sessions: map[*session]struct{}{},
 		latency: newLatencyWindow(20000), blockCap: 200, upstreamTimeout: 3 * time.Second}

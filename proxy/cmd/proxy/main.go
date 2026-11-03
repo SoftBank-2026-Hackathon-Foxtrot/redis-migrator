@@ -114,9 +114,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+	backends := []*redisx.Endpoint{route.Active}
+	for _, n := range order {
+		if eps[n] != route.Active {
+			backends = append(backends, eps[n])
+		}
+	}
 	var p *Proxy
 	for i := 0; ; i++ { // backends may still be starting
-		if p, err = NewProxy(route, rec.Paused, clients); err == nil {
+		if p, err = NewProxy(route, rec.Paused, clients, backends); err == nil {
 			break
 		}
 		if i == 30 {

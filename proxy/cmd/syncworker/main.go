@@ -92,6 +92,8 @@ type startReq struct {
 	Dst     string   `json:"dst"`
 	Include []string `json:"include"`
 	Workers int      `json:"workers"`
+	// ExpectSynced: picking a sync up again, so src must not have lost what dst holds.
+	ExpectSynced bool `json:"expect_synced"`
 }
 
 func (s *server) start(w http.ResponseWriter, r *http.Request) {
@@ -116,14 +118,19 @@ func (s *server) start(w http.ResponseWriter, r *http.Request) {
 		old.Stop()
 	}
 	sy := NewSyncer(src, dst, req.Include, req.Workers)
-	if err := sy.Start(10 * time.Second); err != nil {
+	s.mu.Lock()
+	s.sy = sy // visible during the first scan, which can take a while
+	s.mu.Unlock()
+	if err := sy.Start(10*time.Second, req.ExpectSynced); err != nil {
+		s.mu.Lock()
+		if s.sy == sy {
+			s.sy = nil
+		}
+		s.mu.Unlock()
 		sy.Stop()
 		fail(w, 500, err)
 		return
 	}
-	s.mu.Lock()
-	s.sy = sy
-	s.mu.Unlock()
 	log.Printf("sync %s → %s started for %v", src.Name, dst.Name, req.Include)
 	writeJSON(w, 201, sy.Status())
 }

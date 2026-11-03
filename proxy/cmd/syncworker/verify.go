@@ -1,26 +1,139 @@
 package main
 
 // VERIFY: compare src and dst while writes are paused.
-//   delta mode:      only the keys marked since the precompare, then key counts and a sample
+//   delta mode:      only the keys not compared since they last changed, then a sample
+//   count mode:      key counts per prefix, before the pause: it takes time in proportion
+//                    to all the keys, and what writes do meanwhile is known from the marks
 //   full prefixes:   key sets of both sides must match, then every value and TTL
 //   sample prefixes: key counts must agree (TTL expiry may differ a little),
 //                    then up to N keys taken from src are compared
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"statemig/internal/redisx"
 )
 
-const verifyBatch = 200 // keys per round trip
+const (
+	verifyBatch   = 200 // keys per round trip
+	verifyWorkers = 8   // round trips at once
+)
 
 type VerifyReq struct {
-	Full   []string       `json:"full"`
-	Sample map[string]int `json:"sample"`
-	Mode   string         `json:"mode"` // "" or "delta"
+	Full       []string       `json:"full"`
+	Sample     map[string]int `json:"sample"`
+	Mode       string         `json:"mode"`        // "", "delta" or "count"
+	DeadlineMs int            `json:"deadline_ms"` // 0 = none
+}
+
+var errDeadline = errors.New("verify deadline exceeded")
+
+func deadlineOf(req VerifyReq) time.Time {
+	if req.DeadlineMs <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(time.Duration(req.DeadlineMs) * time.Millisecond)
+}
+
+func past(deadline time.Time) bool { return !deadline.IsZero() && time.Now().After(deadline) }
+
+// comparer compares groups of keys on several connections at once.
+type comparer struct {
+	s        *Syncer
+	deadline time.Time
+	jobs     chan []string
+	wg       sync.WaitGroup
+	mu       sync.Mutex
+	bad      []string
+	compared int
+	err      error
+}
+
+func (s *Syncer) newComparer(deadline time.Time) *comparer {
+	c := &comparer{s: s, deadline: deadline, jobs: make(chan []string)}
+	srcEP, dstEP, _ := s.dir()
+	for i := 0; i < verifyWorkers; i++ {
+		c.wg.Add(1)
+		go c.run(srcEP, dstEP)
+	}
+	return c
+}
+
+func (c *comparer) fail(err error) {
+	c.mu.Lock()
+	if c.err == nil {
+		c.err = err
+	}
+	c.mu.Unlock()
+}
+
+func (c *comparer) failed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err != nil
+}
+
+func (c *comparer) run(srcEP, dstEP *redisx.Endpoint) {
+	defer c.wg.Done()
+	var src, dst *redisx.Conn
+	defer func() {
+		if src != nil {
+			src.Close()
+		}
+		if dst != nil {
+			dst.Close()
+		}
+	}()
+	for group := range c.jobs { // after a failure, only drains
+		if c.failed() {
+			continue
+		}
+		if past(c.deadline) {
+			c.fail(errDeadline)
+			continue
+		}
+		if c.s.isStopped() {
+			c.fail(errors.New("sync stopped"))
+			continue
+		}
+		var err error
+		if src == nil {
+			if src, err = srcEP.Dial(0); err != nil {
+				c.fail(err)
+				continue
+			}
+		}
+		if dst == nil {
+			if dst, err = dstEP.Dial(0); err != nil {
+				c.fail(err)
+				continue
+			}
+		}
+		bad, err := c.s.compareKeys(src, dst, group)
+		if err != nil {
+			c.fail(err)
+			continue
+		}
+		c.mu.Lock()
+		c.compared += len(group)
+		c.bad = append(c.bad, bad...)
+		c.mu.Unlock()
+	}
+}
+
+func (c *comparer) Submit(group []string) { c.jobs <- group }
+
+func (c *comparer) Wait() ([]string, int, error) {
+	close(c.jobs)
+	c.wg.Wait()
+	return c.bad, c.compared, c.err
 }
 
 type prefixReport struct {
@@ -222,63 +335,106 @@ func abs64(x int64) int64 {
 	return x
 }
 
-// verifyDelta: the keys marked since the precompare, then key counts and a sample.
-func (s *Syncer) verifyDelta(src, dst *redisx.Conn, req VerifyReq) (map[string]*prefixReport, bool, error) {
+// verifyDelta: the keys not compared since they last changed, then a sample.
+func (s *Syncer) verifyDelta(src *redisx.Conn, req VerifyReq) (map[string]*prefixReport, bool, error) {
 	out := map[string]*prefixReport{}
 	ok := true
-	delta := s.deltaKeys()
-	r := &prefixReport{Mode: "delta", SrcKeys: len(delta)}
-	for i := 0; i < len(delta); i += verifyBatch {
-		group := delta[i:min(i+verifyBatch, len(delta))]
-		bad, err := s.compareKeys(src, dst, group)
-		if err != nil {
-			return nil, false, err
+	deadline := deadlineOf(req)
+	compare := func(keys []string, r *prefixReport) error {
+		cmp := s.newComparer(deadline)
+		for i := 0; i < len(keys); i += verifyBatch {
+			cmp.Submit(keys[i:min(i+verifyBatch, len(keys))])
 		}
-		r.Compared += len(group)
+		bad, n, err := cmp.Wait()
+		if err != nil {
+			return err
+		}
+		r.Compared += n
 		if len(bad) > 0 {
 			ok = false
 			r.Mismatched = append(r.Mismatched, bad[:min(20, len(bad))]...)
 		}
+		return nil
+	}
+	delta := s.deltaKeys()
+	r := &prefixReport{Mode: "delta", SrcKeys: len(delta)}
+	if err := compare(delta, r); err != nil {
+		return nil, false, err
 	}
 	out["delta"] = r
 	for p, n := range req.Sample {
-		pr := &prefixReport{Mode: fmt.Sprintf("count + sample %d", n)}
-		sk, err := scanKeys(src, p, 0)
+		pr := &prefixReport{Mode: fmt.Sprintf("sample %d", n)}
+		sample, err := scanKeys(src, p, n)
 		if err != nil {
 			return nil, false, err
 		}
-		dk, err := scanKeys(dst, p, 0)
-		if err != nil {
+		if err := compare(sample, pr); err != nil {
 			return nil, false, err
-		}
-		pr.SrcKeys, pr.DstKeys = len(sk), len(dk)
-		if abs(len(sk)-len(dk)) > max(2, len(sk)/1000) {
-			pr.CountDiff = len(dk) - len(sk)
-			ok = false
-		}
-		step := max(1, len(sk)/max(1, n))
-		var sample []string
-		for i := 0; i < len(sk) && len(sample) < n; i += step {
-			sample = append(sample, sk[i])
-		}
-		for i := 0; i < len(sample); i += verifyBatch {
-			group := sample[i:min(i+verifyBatch, len(sample))]
-			bad, err := s.compareKeys(src, dst, group)
-			if err != nil {
-				return nil, false, err
-			}
-			pr.Compared += len(group)
-			if len(bad) > 0 {
-				ok = false
-				pr.Mismatched = append(pr.Mismatched, bad[:min(20, len(bad))]...)
-			}
 		}
 		out[p] = pr
 	}
 	return out, ok, nil
 }
 
+// verifyCount compares key counts while writes continue. Writes can move the counts apart
+// by at most what was marked or waiting meanwhile. Keys appearing on dst after this and
+// before the pause go unnoticed: the same accepted risk as a value changed on dst alone.
+func (s *Syncer) verifyCount(req VerifyReq) (map[string]*prefixReport, bool, error) {
+	srcEP, dstEP, _ := s.dir()
+	before := s.marked.Load()
+	out := map[string]*prefixReport{}
+	for p := range req.Sample {
+		out[p] = &prefixReport{Mode: "count"}
+	}
+	count := func(ep *redisx.Endpoint, field func(*prefixReport) *int) error {
+		c, err := ep.Dial(0)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		return s.scanIncluded(c, func(keys []string) error {
+			for _, k := range keys {
+				for p, pr := range out {
+					if strings.HasPrefix(k, p) {
+						*field(pr)++
+					}
+				}
+			}
+			return nil
+		})
+	}
+	var wg sync.WaitGroup
+	var srcErr, dstErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		srcErr = count(srcEP, func(r *prefixReport) *int { return &r.SrcKeys })
+	}()
+	go func() {
+		defer wg.Done()
+		dstErr = count(dstEP, func(r *prefixReport) *int { return &r.DstKeys })
+	}()
+	wg.Wait()
+	if err := errors.Join(srcErr, dstErr); err != nil {
+		return nil, false, err
+	}
+	waiting, _ := s.Backlog()
+	slack := int(s.marked.Load()-before) + waiting
+	ok := true
+	for _, pr := range out {
+		if abs(pr.SrcKeys-pr.DstKeys) > max(2, pr.SrcKeys/1000)+slack {
+			pr.CountDiff = pr.DstKeys - pr.SrcKeys
+			ok = false
+		}
+	}
+	return out, ok, nil
+}
+
 func (s *Syncer) Verify(req VerifyReq) (map[string]*prefixReport, bool, error) {
+	if req.Mode == "count" {
+		return s.verifyCount(req)
+	}
+	deadline := deadlineOf(req)
 	srcEP, dstEP, _ := s.dir()
 	src, err := srcEP.Dial(0)
 	if err != nil {
@@ -292,7 +448,7 @@ func (s *Syncer) Verify(req VerifyReq) (map[string]*prefixReport, bool, error) {
 	defer dst.Close()
 
 	if req.Mode == "delta" {
-		return s.verifyDelta(src, dst, req)
+		return s.verifyDelta(src, req)
 	}
 	out := map[string]*prefixReport{}
 	ok := true
@@ -324,6 +480,9 @@ func (s *Syncer) Verify(req VerifyReq) (map[string]*prefixReport, bool, error) {
 			}
 		}
 		for i := 0; i < len(sk); i += verifyBatch {
+			if past(deadline) {
+				return nil, false, errDeadline
+			}
 			group := sk[i:min(i+verifyBatch, len(sk))]
 			bad, err := s.compareKeys(src, dst, group)
 			if err != nil {

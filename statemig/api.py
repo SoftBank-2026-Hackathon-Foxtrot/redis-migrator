@@ -51,6 +51,17 @@ async def recover_saved_migration():
     current = Migration.load(proxy, sync, record, store, ENDPOINTS, APP_USER)
     if current:
         asyncio.create_task(current.recover())
+    asyncio.create_task(_watch())
+
+
+async def _watch():
+    while True:
+        await asyncio.sleep(1)
+        try:
+            if current:
+                await current.watch_once()
+        except Exception:  # noqa: BLE001  the next round tries again
+            logging.getLogger("statemig.api").exception("watch")
 
 
 class StartReq(BaseModel):
@@ -99,11 +110,15 @@ async def _new_migration(req: StartReq) -> Migration:
     if px["active"] != px["consume"]:
         raise HTTPException(409, "queue drain of the previous move is still running")
     if current and current.state in ("PRECHECK", "SYNCING", "DRAINING", "ROLLING_BACK_DRAIN"):
-        raise HTTPException(409, f"migration {current.source.name}→{current.target.name} is {current.state}")
+        view = await current.sync_view()
+        restartable = current.state == "SYNCING" and (not view["running"] or view["halted"])
+        if not restartable:     # a sync that is gone or halted may be prepared again; nothing was switched yet
+            raise HTTPException(409, f"migration {current.source.name}→{current.target.name} is {current.state}")
     if record.read() is None:   # first run: record what the proxy is serving now
         record.write(gen=px["gen"], active=px["active"], consume=px["consume"], paused=False)
     if current:
         history.append(current.status())
+        current.retire()
     current = Migration(proxy, sync, record, ENDPOINTS[px["active"]], ENDPOINTS[req.target], APP_USER, store, req.mode)
     return current
 
@@ -151,7 +166,7 @@ async def _track(op: dict, coro):
         op["result"] = await coro
         op["state"] = "succeeded"
     except Exception as e:  # noqa: BLE001  reported through /v1/status
-        op["state"], op["error"] = "failed", str(e)
+        op["state"], op["error"] = "failed", str(e) or type(e).__name__    # httpx timeouts have no message
 
 
 def _begin(name: str, coro) -> dict:
@@ -205,4 +220,4 @@ async def v1_status():
     return {"resource": "redis", "phase": phase, "ready": ready, "source": m.source.name if m else None,
             "target": m.target.name if m else None, "active": (record.read() or {}).get("active"),
             "operation": operation, "last_cutover": m.last_cutover if m else None,
-            "events": m.events[-20:] if m else []}
+            "sync": await m.sync_view() if m else None, "events": m.events[-20:] if m else []}

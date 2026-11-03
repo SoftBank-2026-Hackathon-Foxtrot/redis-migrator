@@ -1,0 +1,4 @@
+# statemig with the crash points of demo/crashhook.py. Only for demo/recovery_check.py.
+services:
+  statemig:
+    command: python -m demo.crashhook
