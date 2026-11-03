@@ -139,6 +139,9 @@ var (
 	// Starting a transaction is held during PAUSE like a write, so no new
 	// transaction opens while the proxy waits for the open ones to finish.
 	txStartCmds = set("multi", "watch")
+	// Held like writes too: nothing is published while a switch moves the subscriptions, and the
+	// set of subscriptions does not change under it. PUBLISH has no "write" flag in COMMAND.
+	pubsubHeldCmds = set("publish", "spublish", "subscribe", "psubscribe", "unsubscribe", "punsubscribe")
 	// Queue consumer commands: routed to the consume backend until DRAIN_DONE.
 	consumeCmds = set("xreadgroup", "xack", "xautoclaim", "xclaim", "xpending", "xinfo")
 	// Always rejected: whole-db / admin commands the app has no business sending.
@@ -181,5 +184,5 @@ func LoadCmdTable(c *redisx.Conn) (CmdTable, KeyTable, error) {
 
 // Held reports whether the command is held at the gate during PAUSE.
 func (t CmdTable) Held(name string) bool {
-	return t[name] || scriptCmds[name] || txStartCmds[name]
+	return t[name] || scriptCmds[name] || txStartCmds[name] || pubsubHeldCmds[name]
 }

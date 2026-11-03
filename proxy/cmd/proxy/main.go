@@ -145,6 +145,7 @@ func main() {
 	mux.HandleFunc("POST /pause", s.pause)
 	mux.HandleFunc("POST /switch", s.switchRoute)
 	mux.HandleFunc("POST /resume", s.resume)
+	mux.HandleFunc("POST /presubscribe", s.presubscribe)
 	mux.HandleFunc("POST /drain-done", s.drainDone)
 	addr := env("STATEMIG_ADMIN", ":7000")
 	log.Printf("admin API on %s", addr)
@@ -231,6 +232,33 @@ func (s *server) switchRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.proxy.Status())
+}
+
+// presubscribe subscribes every moved session on the next backend ahead of SWITCH.
+func (s *server) presubscribe(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Target    string `json:"target"`
+		MaxWaitMs int    `json:"max_wait_ms"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		fail(w, err)
+		return
+	}
+	ep := s.endpoints[req.Target]
+	if ep == nil {
+		fail(w, fmt.Errorf("%w: unknown backend %q", ErrState, req.Target))
+		return
+	}
+	if req.MaxWaitMs <= 0 {
+		req.MaxWaitMs = 1000
+	}
+	t0 := time.Now()
+	n, err := s.proxy.Presubscribe(ep, time.Duration(req.MaxWaitMs)*time.Millisecond)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"sessions": n, "ms": msSince(t0)})
 }
 
 func (s *server) resume(w http.ResponseWriter, _ *http.Request) {

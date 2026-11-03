@@ -2,7 +2,7 @@
 
   start:    precheck → keyspace notifications on → target queue groups → Sync Worker (src → dst)
             → full compare while writes continue (mode "delta")
-  cutover:  PAUSE → FINAL RECONCILE → VERIFY → SWITCH (record gen first) → FENCE SOURCE
+  cutover:  PAUSE → FINAL RECONCILE → VERIFY → PRESUBSCRIBE → SWITCH (record gen first) → FENCE SOURCE
             → REVERSE SYNC (subscription confirmed) → RESUME → QUEUE DRAIN (background)
             mode "delta" (default): reconcile and verify only what changed since the compare,
             plus key counts and a sample. mode "full": copy and compare everything in the pause
@@ -348,6 +348,11 @@ class Migration:
                 raise MigrationError(f"verify failed: {v['prefixes']}")
             if missing := await _missing_groups(new):
                 raise MigrationError(f"verify failed: no queue group on {new.name}: {missing}")
+            # PRESUBSCRIBE: every subscribed client gets the same subscriptions on the new side now,
+            # while nothing is published; one that cannot calls the cutover off with nothing changed.
+            ps = await self.proxy.call("POST", "/presubscribe", {"target": new.name, "max_wait_ms": left()},
+                                       timeout=left() / 1000 + 1)
+            timings["presubscribed"] = ps["sessions"]
             if spent() > budget_ms:     # the steps left are quick; past the budget, writes come first
                 raise MigrationError(f"budget exceeded: {round(spent())}ms > {budget_ms}ms before the switch")
         except (MigrationError, httpx.HTTPError) as e:
@@ -775,8 +780,10 @@ class Migration:
             return
         c = ep.client()
         try:
+            # PUBLISH is not in @write: it is taken away too, or a client off the proxy could still
+            # publish to a side nobody subscribes to any more.
             rules = ["on", "~*", "&*", "+@all"] if allowed else ["on", "~*", "&*", "+@all", "-@write",
-                                                                 *CONSUME_CMDS.split()]
+                                                                 "-publish", "-spublish", *CONSUME_CMDS.split()]
             await c.execute_command("ACL", "SETUSER", self.app_user, *rules)
             try:
                 await c.execute_command("ACL", "SAVE")

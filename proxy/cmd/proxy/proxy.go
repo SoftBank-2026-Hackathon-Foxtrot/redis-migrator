@@ -75,7 +75,11 @@ type ProxyStats struct {
 	Denied         atomic.Int64
 	Switches       atomic.Int64
 	CacheBypassed  atomic.Int64 // cache commands answered by the proxy during PAUSE
-	LastPauseMs   atomic.Value // float64, PAUSE → RESUME
+	PubsubMoved    atomic.Int64 // subscriptions moved by a switch, every old message relayed first
+	PubsubCut      atomic.Int64 // moved, but the old backend's last messages could not be confirmed
+	PubsubDropped  atomic.Int64 // could not be moved: closed, the client resubscribes
+	PubsubRepaired atomic.Int64 // re-subscribed on the active backend after its upstream died
+	LastPauseMs    atomic.Value // float64, PAUSE → RESUME
 	MaxPauseMs     atomic.Value
 }
 
@@ -106,7 +110,7 @@ func NewProxy(route Route, paused bool, clients map[string]Client, backends []*r
 	}
 	p := &Proxy{clients: clients, cmds: ct, keys: kt, route: route, paused: paused, sessions: map[*session]struct{}{},
 		pendingCache: map[string]int{},
-		latency: newLatencyWindow(20000), blockCap: 200, upstreamTimeout: 3 * time.Second}
+		latency:      newLatencyWindow(20000), blockCap: 200, upstreamTimeout: 3 * time.Second}
 	if paused {
 		p.pausedAt = time.Now()
 	}
@@ -236,7 +240,7 @@ func (p *Proxy) Switch(r Route) error {
 	p.epoch++
 	var subs []*session
 	for s := range p.sessions {
-		if s.pubsub.Load() { // subscriptions live on the old server: make clients resubscribe
+		if s.pubsub.Load() && s.sub.Load() == nil { // MONITOR, SSUBSCRIBE: not moved, the client resubscribes
 			subs = append(subs, s)
 		}
 	}
@@ -244,6 +248,7 @@ func (p *Proxy) Switch(r Route) error {
 	for _, s := range subs {
 		s.nc.Close()
 	}
+	p.moveSubs(r.Active) // still paused: no PUBLISH reaches the new backend before this is done
 	p.Stats.Switches.Add(1)
 	log.Printf("switch gen %d→%d active %s→%s consume %s→%s", old.Gen, r.Gen, old.Active.Name, r.Active.Name,
 		old.Consume.Name, r.Consume.Name)
@@ -272,7 +277,9 @@ func (p *Proxy) Resume() float64 {
 	p.paused = false
 	ms := msSince(p.pausedAt)
 	p.cond.Broadcast()
+	active := p.route.Active.Name
 	p.mu.Unlock()
+	p.dropPrepared(active) // a cutover called off after PRESUBSCRIBE
 	p.Stats.LastPauseMs.Store(ms)
 	if ms > p.Stats.MaxPauseMs.Load().(float64) {
 		p.Stats.MaxPauseMs.Store(ms)
@@ -295,6 +302,11 @@ func (p *Proxy) Status() map[string]any {
 	st["denied"] = p.Stats.Denied.Load()
 	st["switches"] = p.Stats.Switches.Load()
 	st["cache_bypassed"] = p.Stats.CacheBypassed.Load()
+	st["pubsub_sessions"] = len(p.subSessions())
+	st["pubsub_moved"] = p.Stats.PubsubMoved.Load()
+	st["pubsub_cut"] = p.Stats.PubsubCut.Load()
+	st["pubsub_dropped"] = p.Stats.PubsubDropped.Load()
+	st["pubsub_repaired"] = p.Stats.PubsubRepaired.Load()
 	st["last_pause_ms"] = p.Stats.LastPauseMs.Load()
 	st["max_pause_ms"] = p.Stats.MaxPauseMs.Load()
 	st["latency_ms"] = p.latency.summary()
@@ -321,6 +333,8 @@ type session struct {
 	txEP     *redisx.Endpoint // a transaction stays on the backend it started on
 	hello    [][]byte         // HELLO (protocol version, SETNAME) replayed on reconnect
 	pubsub   atomic.Bool
+	sub      atomic.Pointer[subState] // a subscription the proxy can move to another backend
+	wmu      sync.Mutex               // client writes, once a subscription reader writes too
 }
 
 // login checks an account and remembers its role.
@@ -483,6 +497,11 @@ func (s *session) run() {
 		}
 		s.reply(buf)
 
+		if movableSubCmds[name] && len(buf) > 0 && buf[0] != '-' {
+			s.pubsub.Store(true)
+			s.subscribed(ep, name, args)
+			return
+		}
 		if pubsubCmds[name] && len(buf) > 0 && buf[0] != '-' {
 			s.pubsub.Store(true)
 			s.pipe(s.ups[ep.Name])
