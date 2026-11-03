@@ -15,7 +15,8 @@ package main
 //	RESUME        the held PUBLISHes go to the new backend, where the subscriptions already are
 //
 // A message is published to exactly one backend, so none arrives twice. MONITOR and SSUBSCRIBE are
-// not moved: those sessions are still closed on a switch.
+// not moved: those sessions are still closed on a switch. A moved session only takes the commands
+// in subSessionCmds: anything else would need the gate, the checks and the tracking of session.run.
 
 import (
 	"bytes"
@@ -33,7 +34,17 @@ import (
 	"statemig/internal/redisx"
 )
 
-var movableSubCmds = set("subscribe", "psubscribe")
+var (
+	movableSubCmds = set("subscribe", "psubscribe")
+	subSessionCmds = set("subscribe", "psubscribe", "unsubscribe", "punsubscribe", "ping")
+)
+
+const (
+	clientWriteTimeout = 5 * time.Second        // a subscriber that takes no data for this long is closed
+	stuckClientGrace   = 100 * time.Millisecond // a reader whose upstream is closed can only be stuck on its client
+)
+
+var errStuckClient = errors.New("client is not reading")
 
 // subState is what a subscribed session needs to be moved.
 type subState struct {
@@ -133,6 +144,7 @@ func (st *subState) subscribeAll(c *redisx.Conn) error {
 func (s *session) writeClient(frame []byte) error {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
+	s.nc.SetWriteDeadline(time.Now().Add(clientWriteTimeout))
 	s.cw.Write(frame)
 	return s.cw.Flush()
 }
@@ -240,13 +252,27 @@ func (s *session) subscribed(ep *redisx.Endpoint, name string, args [][]byte) {
 			s.writeClient(redisx.SimpleReply("OK"))
 			return
 		}
-		_, _, held, _, _ := p.enter(name, args, s.db, false, s.resp3())
+		why := ""
+		if !subSessionCmds[name] {
+			why = "ERR " + name + " is not allowed on a subscribed connection through the proxy"
+		} else if d := s.role.deny(name, args, p.keys); d != "" {
+			why = "NOPERM " + d
+		}
+		if why != "" {
+			p.Stats.Denied.Add(1)
+			if s.writeClient(redisx.ErrorReply(why)) != nil {
+				return
+			}
+			continue
+		}
+		_, _, held, _, pending := p.enter(name, args, s.db, false, s.resp3())
 		st.mu.Lock()
 		st.track(name, args)
+		st.rd.conn.NetConn().SetWriteDeadline(time.Now().Add(p.upstreamTimeout)) // a switch waits on st.mu
 		redisx.WriteCommand(st.rd.conn.Writer(), args...)
 		err = st.rd.conn.Writer().Flush()
 		st.mu.Unlock()
-		p.exit(held, 0, nil)
+		p.exit(held, 0, pending)
 		if err != nil {
 			return
 		}
@@ -315,9 +341,16 @@ func (s *session) move(st *subState, ep *redisx.Endpoint, timeout time.Duration)
 	}
 	old.retired.Store(true)
 	old.conn.Close()
-	<-old.done
 	c := st.prepared
 	st.prepared, st.preparedFor = nil, ""
+	select {
+	case <-old.done:
+	case <-time.After(stuckClientGrace): // writes are held for every client while this one waits
+		s.nc.Close()
+		<-old.done
+		c.Close()
+		return false, errStuckClient
+	}
 	s.startReader(st, c, ep)
 	return complete, nil
 }
