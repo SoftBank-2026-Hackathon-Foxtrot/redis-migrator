@@ -14,6 +14,16 @@ Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 �
 | Sync Worker (Go) | `proxy/cmd/syncworker` | 관리 `7100` | keyspace 알림과 스캔으로 복사, 역방향 동기화, 값 비교 |
 | statemig (FastAPI) | `statemig/` | `8090` | 전환·롤백 단계 실행. 오케스트레이터가 호출 |
 
+## 지원 범위
+
+- 옮기는 키: `session:`, `cache:`, `q:delayed`, 실패 큐 `q:join:dead`, `q:notify:dead`. `rl:`은 옮기지 않는다
+- 작업 큐 `q:join`, `q:notify`는 복사하지 않고, 원본을 다 소비한 뒤 소비자를 옮긴다
+- Pub/Sub 구독(`SUBSCRIBE`, `PSUBSCRIBE`)은 전환해도 연결이 유지된다. 정상 전환과 정상 롤백에서는 메시지 유실·중복이 없다. `MONITOR`와 `SSUBSCRIBE`는 끊는다
+- 여러 db는 번호 그대로 옮긴다
+- 사전 점검에서 거부: Cluster 모드, 반대쪽에 없는 db 번호, db 0 밖의 큐, `maxmemory`가 있는데 `noeviction`이 아닌 경우
+
+관리형 Redis는 CONFIG가 막혀 있으므로 keyspace 알림(`KEA`)과 `maxmemory-policy noeviction`을 파라미터 그룹이나 인스턴스 설정으로 켜 둬야 한다. ACL도 막혀 있어서 원본 쓰기 차단은 자격 증명 분리로만 동작한다.
+
 ## 공통 API
 
 오케스트레이터가 호출하는 API다. [마이그레이션 공통 Design Doc](https://app.notion.com/p/40d8bee9ada4815e9e94ee454be82d4a) 초안 0.2의 형식을 따른다. `:8090`에서 제공하며 `Authorization: Bearer <STATEMIG_ADMIN_TOKEN>`이 필요하다. POST에는 `Idempotency-Key`도 필요하다.
@@ -84,7 +94,7 @@ ACTIVE → QUIESCED → ROLLED_BACK_HELD → RESTORED → COMPLETED
 | 서비스 | 경로 |
 |---|---|
 | statemig | `POST /migrations`, `GET /migrations/current/ready`, `POST /migrations/current/{cutover,rollback,commit}`, `GET /status`, `/internal/{prepare,execute,rollback,commit,abort,status}` |
-| 프록시 | `GET /status`, `POST /pause`, `POST /switch`, `POST /resume`, `POST /drain-done` |
+| 프록시 | `GET /status`, `POST /pause`, `POST /presubscribe`, `POST /switch`, `POST /resume`, `POST /drain-done` |
 | Sync Worker | `GET /status`, `POST /start`, `POST /precompare`, `POST /reconcile`, `POST /verify`, `POST /reverse`, `POST /stop` |
 
 ## 배포 위치
@@ -114,14 +124,27 @@ cd demo && docker compose up -d --build
 | `python demo/recovery_check.py` | Redis가 빈 채로 재시작, 프록시·Sync Worker·statemig가 전환 도중 사망 |
 | `python demo/onprem_check.py` | 온프레 Valkey 전환과 롤백 |
 | `python demo/chain_check.py` | aws → 온프레 → gcp 연속 이전 |
+| `python demo/multidb_check.py` | 여러 db의 번호 유지, 실패 큐 |
+| `python demo/topology_check.py` | 사전 점검의 거부 조건 (자체 컨테이너) |
+| `python demo/loss_report_check.py` | 장애 롤백의 유실 범위 보고 |
+| `python demo/pubsub_check.py` | 전환 중 구독 유지, 메시지 유실·중복 |
+| `cd proxy && go test ./...` | 멈춘 구독자, 구독 연결의 명령 제한 |
 | `python demo/aws_check.py` | 실제 ElastiCache. 같은 VPC의 호스트에서 실행 |
 
 `demo/app`은 검사에서 부하를 거는 앱이다. 실제 공구앱은 [demo 레포](https://github.com/SoftBank-2026-Hackathon-Foxtrot/demo)에 있다.
 
+## 실환경 검증 (2026-11-03)
+
+ElastiCache for Valkey 8.0, Memorystore for Redis 7.2, 온프레 Valkey 8.0을 Tailscale로 잇고 부하 중에 옮겼다. 상세는 [검증 결과](https://app.notion.com/p/40d8bee9ada48102a0ccfb62720fe22f)에 있다.
+
+- 컷오버, 정상 롤백, 연속 이전: 쓰기 정지 210~676ms. 채팅(Pub/Sub) 유실·중복, WebSocket 끊김, 로그인 실패 모두 0건
+- Valkey 8.0과 Redis 7.2 사이의 `DUMP`/`RESTORE`는 양방향으로 동작했다
+- 장애 롤백: 쓰기 정지 0.5~4.1초. 간헐적인 약 3.6초 지연은 원인을 찾지 못했고, 이때는 예산 1800ms를 넘는다
+- 구간별 1~2회, 키 7600개, 구독 3개 이하 규모다. DB·오브젝트·트래픽 계층과의 통합과 오케스트레이터는 포함하지 않았다
+
 ## 아직 안 된 것
 
-- AWS 관리 VPC 배포와 Tailscale 구간 검증
-- Memorystore 검증
+- 장애 롤백의 간헐적 3.6초 지연 원인
 - 오케스트레이터 연결
 - 공통 스펙 확정 후 API 조정
 
