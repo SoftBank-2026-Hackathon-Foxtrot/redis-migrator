@@ -194,14 +194,23 @@ class Migration:
         return r
 
     async def start(self, budget_ms: int = 1800, timeout_s: int | None = None) -> None:
+        await self.check(budget_ms)
+        await self.start_sync(timeout_s)
+
+    async def check(self, budget_ms: int = 1800) -> dict:
         async with self._lock:
-            self.ready_by = time.time() + timeout_s if timeout_s else None
             self.precheck_report = await self.precheck(budget_ms)
             self.fence_mode = self.precheck_report.get("fence", {})
             self._event("precheck", **{k: v for k, v in self.precheck_report.items() if k != "warnings"})
             if self.precheck_report["errors"]:
                 self.state = "FAILED"
                 raise MigrationError("; ".join(self.precheck_report["errors"]))
+            self._save()
+            return self.precheck_report
+
+    async def start_sync(self, timeout_s: int | None = None) -> None:
+        async with self._lock:
+            self.ready_by = time.time() + timeout_s if timeout_s else None
             await _ensure_groups(self.target)
             await self._set_write(self.target, True)
             await self.sync.call("POST", "/start", {"src": self.source.name, "dst": self.target.name,
@@ -270,7 +279,7 @@ class Migration:
             self._event("normal rollback done", **res)
             self.drain_task = asyncio.create_task(self._drain(self.target, res["gen"], "ROLLED_BACK"))
 
-    async def _before_pause(self, budget_ms: int):
+    async def before_pause(self, budget_ms: int):
         """What can be judged while writes still flow, so a hopeless cutover costs no pause."""
         try:
             st = (await self.sync.call("GET", "/status", timeout=5)).get("sync") or {}
@@ -286,7 +295,7 @@ class Migration:
     async def _switch_over(self, old: Endpoint, new: Endpoint, budget_ms: int, kind: str) -> dict:
         """PAUSE … RESUME, shared by cutover and normal rollback."""
         if self.mode == "delta":
-            await self._before_pause(budget_ms)
+            await self.before_pause(budget_ms)
         t0 = time.monotonic()
         spent = lambda: (time.monotonic() - t0) * 1000  # noqa: E731
         left = lambda: max(100, int(budget_ms - spent()))  # noqa: E731
@@ -475,7 +484,7 @@ class Migration:
         """Give up before any cutover. The app never left the source, so only the sync stops.
         What was copied stays on the target; the next prepare compares it again."""
         async with self._lock:
-            if self.state != "SYNCING" or self.switching:
+            if self.state not in ("PRECHECK", "SYNCING") or self.switching:
                 raise MigrationError(f"abort only before a cutover (state={self.state})")
             try:
                 await self.sync.call("POST", "/stop")
@@ -484,6 +493,10 @@ class Migration:
             self.ready_by, self.abort_reason = None, reason
             self.state = "ABORTED"
             self._event("migration aborted before cutover", reason=reason)
+
+    async def stop_sync(self) -> None:
+        async with self._lock:
+            await self.sync.call("POST", "/stop")
 
     async def _give_up_if_late(self):
         if self.state != "SYNCING" or not self.ready_by or time.time() < self.ready_by:

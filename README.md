@@ -16,68 +16,66 @@ Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 �
 
 ## 공통 API
 
-오케스트레이터가 호출하는 API다. statemig `:8090`에서 제공하며 `Authorization: Bearer <STATEMIG_ADMIN_TOKEN>`이 필요하다.
+오케스트레이터가 호출하는 API다. [마이그레이션 공통 Design Doc](https://app.notion.com/p/40d8bee9ada4815e9e94ee454be82d4a) 초안 0.2의 형식을 따른다. `:8090`에서 제공하며 `Authorization: Bearer <STATEMIG_ADMIN_TOKEN>`이 필요하다. POST에는 `Idempotency-Key`도 필요하다.
 
-공통 스펙이 확정되기 전 임시안이다. 경로와 필드는 스펙에 맞춰 바뀔 수 있다.
-
-| 메서드 | 경로 | 본문 | 동작 |
-|---|---|---|---|
-| POST | `/v1/prepare` | `{"target":"gcp","budget_ms":1800,"mode":"delta","timeout_s":600}` | 사전 점검 후 동기화 시작. `timeout_s`는 선택이고, 그때까지 `ready`가 안 되면 이전을 취소한다 |
-| POST | `/v1/abort` | 없음 | 컷오버 전에 이전 취소. 동기화만 멈추고 앱은 원본을 계속 쓴다 |
-| POST | `/v1/execute` | `{"budget_ms":1800}` | 컷오버 |
-| POST | `/v1/rollback` | `{"mode":"normal","budget_ms":1800}` | 원본으로 복귀. 대상이 죽었으면 `"mode":"failure"` |
-| POST | `/v1/commit` | 없음 | 역방향 동기화를 끝내고 이전 확정 |
-| GET | `/v1/status` | 없음 | 현재 단계와 결과 조회 |
-
-POST는 바로 `202`를 돌려주고 작업은 뒤에서 돈다. 결과는 `/v1/status`로 확인한다.
+| 메서드 | 경로 | 동작 |
+|---|---|---|
+| GET | `/v1/capabilities` | 지원 프로필과 제약 |
+| POST | `/v1/migrations` | 계획 등록. 외부 변경 없음 |
+| GET | `/v1/migrations/{id}` | 현재 상태와 진행 판정 |
+| POST | `/v1/migrations/{id}/actions` | 명령 접수. `202`와 `operationId` |
+| GET | `/v1/operations/{id}` | 명령 결과 |
 
 ```json
-{
-  "resource": "redis",
-  "phase": "executed",
-  "ready": false,
-  "source": "aws",
-  "target": "gcp",
-  "active": "gcp",
-  "operation": {"name": "execute", "state": "succeeded", "error": null, "result": {}},
-  "last_cutover": {"paused_ms": 38.9, "total_ms": 42.1},
-  "sync": {"running": true, "halted": null, "backlog": 0, "lag_ms": 4, "changed_keys": 0, "error": null, "not_ready": null},
-  "events": []
-}
+{"workflowId":"wf-001","resourceId":"redis-main","kind":"REDIS","profile":"redis-proxy-sync-v1",
+ "sourceRef":"resource:aws","targetRef":"resource:gcp","bindingRef":"binding:redis-proxy",
+ "policy":{"rollbackMode":"REVERSE_REQUIRED","maxQuiesceSeconds":1.8,"readyTimeoutSeconds":600}}
 ```
 
-`sync`는 동기화 상태다. `lag_ms`는 원본에 쓴 표시 키의 알림이 돌아오기까지 걸린 시간, `changed_keys`는 다음 쓰기 정지에서 검증할 키 수, `not_ready`는 아직 `ready`가 아닌 이유다. `ready`는 `lag_ms`와 backlog를 복사하는 데 걸릴 시간이 각각 1초 이하인 상태가 3초 이어져야 켜진다. `halted`에 값이 있으면 재시작한 Redis가 데이터를 잃어 복사와 삭제를 멈춘 것이고, 그 Redis가 쓰기 대상이면 장애 롤백이나 commit 중에 사람이 고른다. `prepare` 전 단계라면 `prepare`로 다시 시작할 수 있다.
+```json
+{"action":"CUTOVER","expectedRevision":8,"transitionId":"tx-001","quiesceRef":"quiesce:redis-main:tx-001:1"}
+```
 
-| `phase` | 뜻 |
+| 명령 | Redis에서 하는 일 |
 |---|---|
-| `idle` | 진행 중인 이전 없음 |
-| `preparing` | 사전 점검 또는 동기화 중 |
-| `ready` | 컷오버 가능 |
-| `executing` | 컷오버 또는 큐 비우기 중 |
-| `executed` | 전환 완료. 롤백이나 commit 가능 |
-| `rolling_back`, `rolled_back` | 롤백 중, 완료 |
-| `committing`, `committed` | 확정 중, 완료 |
-| `aborted` | 컷오버 실패로 원본에 복귀했거나 이전을 취소함. 취소 이유는 `abort_reason` |
-| `failed` | 사전 점검 실패 |
-
-| 응답 | 경우 |
-|---|---|
-| `400` | 없는 대상이거나 이미 활성인 대상 |
-| `401` | 토큰 없음 |
-| `404` | 준비된 이전 없음 |
-| `409` | 다른 단계가 실행 중 |
-| `422` | 본문 형식 오류 |
-
-단계 실패는 `operation.state`가 `failed`가 되고 `operation.error`에 이유가 남는다. 정상 롤백은 큐를 다 비운 `executed`부터 가능하다.
-
-statemig는 1초마다 멈춘 단계를 마무리하고, 프록시를 `control.json`에 맞추고, 재시작한 Sync Worker에 동기화를 다시 시작시킨다. 그래서 프로세스가 재시작한 뒤에는 `operation`이 `null`이어도 `phase`가 스스로 바뀐다. 오케스트레이터는 `phase`를 기준으로 판단한다.
-
-호출 순서:
+| `PREPARE` | 사전 점검 |
+| `START_SYNC` | 복사와 변경 추적 시작. `readyTimeoutSeconds`까지 `READY`가 안 되면 취소 |
+| `QUIESCE` | **확인만 한다.** `ready`와 키 수. 쓰기는 멈추지 않는다 |
+| `CUTOVER` | **쓰기 정지, 전환, 재개까지 한 번에.** `maxQuiesceSeconds`가 쓰기 정지 예산 |
+| `RESUME` | **이미 재개된 위치를 확인만 한다.** `expectedLocation`은 `TARGET` 또는 `SOURCE` |
+| `ROLLBACK` | 원본 복귀, 재개까지 포함. `"mode":"failure"`는 대상 장애 시의 유실 감수 복귀 |
+| `CANCEL` | 컷오버 전 취소. 대상 데이터는 남긴다 |
+| `RECONCILE` | 기록과 실제 상태 대조. 외부 변경 없음 |
+| `FINALIZE` | 역방향 또는 정방향 동기화 중지. 원본은 지우지 않는다 |
 
 ```text
-prepare → ready 대기 → execute → executed 대기 → commit
-                                              └→ rollback
+CREATED → PREPARED → SYNCING ↔ READY → QUIESCED → SWITCHED → ACTIVE → COMPLETED
+ACTIVE → QUIESCED → ROLLED_BACK_HELD → RESTORED → COMPLETED
 ```
+
+| 응답 | 코드 |
+|---|---|
+| `400` | `INVALID_REQUEST`: 필수 값 누락 |
+| `401` | 토큰 없음 |
+| `404` | `NOT_FOUND` |
+| `409` | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `RESOURCE_BUSY`, `INVALID_STATE`, `UNKNOWN_STATE` |
+| `422` | `UNSUPPORTED_PROFILE`, `PRECONDITION_FAILED` |
+
+### 공통 문서와 다른 점
+
+전환 동작은 팀 합의 전까지 바꾸지 않았다.
+
+- `QUIESCE`와 `RESUME`은 확인만 한다. 쓰기 정지와 재개는 `CUTOVER`, `ROLLBACK` 안에서 한다.
+- `ROLLBACK`의 `mode=failure`는 대상 장애 때 유실을 감수하고 원본으로 돌아간다. 공통 문서는 이 복귀를 금지한다.
+- 어댑터가 1초마다 스스로 복구한다. 그 결과는 상태 조회에 드러나지만 `UNKNOWN`에서 멈춰 기다리지는 않는다. 어댑터가 명령 도중 재시작한 경우에만 그 명령이 `UNKNOWN`이 되어 `RECONCILE`을 요구한다.
+- 쓰기 정지 예산을 넘으면 전환 전에 취소하고 원본에서 재개한다.
+
+아직 구현하지 않은 것:
+
+- `quiesceRef`는 값이 있는지만 본다. 검증하려면 공유 관리 DB가 필요하다.
+- `readiness.advance`는 `PASS`가 되지 않는다. `WORKLOAD_RUNNING`, `BUSINESS_PROBE`는 오케스트레이터의 근거가 필요해 `UNKNOWN`이다.
+- 계획과 명령 기록은 관리 DB 대신 `common.json`에 저장한다. 검사 근거는 저장하지 않고 조회 때 계산한다.
+- `sourceRef`는 `resource:<STATEMIG_ENDPOINTS의 이름>` 형식이다. 비밀 저장소 참조는 없다.
 
 ## 내부 API
 
@@ -85,7 +83,7 @@ prepare → ready 대기 → execute → executed 대기 → commit
 
 | 서비스 | 경로 |
 |---|---|
-| statemig | `POST /migrations`, `GET /migrations/current/ready`, `POST /migrations/current/{cutover,rollback,commit}`, `GET /status` |
+| statemig | `POST /migrations`, `GET /migrations/current/ready`, `POST /migrations/current/{cutover,rollback,commit}`, `GET /status`, `/internal/{prepare,execute,rollback,commit,abort,status}` |
 | 프록시 | `GET /status`, `POST /pause`, `POST /switch`, `POST /resume`, `POST /drain-done` |
 | Sync Worker | `GET /status`, `POST /start`, `POST /precompare`, `POST /reconcile`, `POST /verify`, `POST /reverse`, `POST /stop` |
 
@@ -109,7 +107,7 @@ cd demo && docker compose up -d --build
 
 | 명령 | 확인 내용 |
 |---|---|
-| `python demo/adapter_check.py` | 공통 API로 prepare, execute, rollback, commit |
+| `python demo/adapter_check.py` | 공통 API의 전체 명령, 재시도, 거부 |
 | `python demo/scenario.py --mode normal` | 부하 중 컷오버, 롤백, commit |
 | `python demo/scenario.py --mode failure` | 대상 Redis 강제 종료 후 롤백 |
 | `python demo/faults.py` | 실패 경로와 권한 제한 |

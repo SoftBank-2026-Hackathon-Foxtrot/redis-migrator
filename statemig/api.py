@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from .backend import Endpoint
+from .common import CommonApi, build_router
 from .migration import Admin, ControlRecord, Migration, MigrationError, MigrationStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -57,6 +58,7 @@ async def recover_saved_migration():
 async def _watch():
     while True:
         await asyncio.sleep(1)
+        common.tick()
         try:
             if current:
                 await current.watch_once()
@@ -152,8 +154,20 @@ async def commit():
     return current.status()
 
 
-# ---- common migration API, what the orchestrator calls --------------------------------
-# Long steps answer 202 at once. The orchestrator polls GET /v1/status.
+# ---- common migration API, what the orchestrator calls: see common.py ------------------
+async def _new_core(target: str, budget_ms: int) -> Migration:
+    try:
+        return await _new_migration(StartReq(target=target, budget_ms=budget_ms))
+    except HTTPException as e:
+        raise MigrationError(str(e.detail)) from e
+
+
+common = CommonApi(proxy, sync, record, ENDPOINTS, str(record.path.with_name("common.json")), lambda: current, _new_core)
+app.include_router(build_router(common))
+
+
+# ---- internal shortcuts for the checks and the demo console ------------------------------
+# Long steps answer 202 at once. Poll GET /internal/status.
 PHASES = {"PRECHECK": "preparing", "SYNCING": "preparing", "DRAINING": "executing", "CUTOVER": "executed",
           "ROLLING_BACK_DRAIN": "rolling_back", "ROLLED_BACK": "rolled_back", "COMMITTED": "committed",
           "ABORTED": "aborted", "FAILED": "failed"}
@@ -183,39 +197,39 @@ def _need_idle():
         raise HTTPException(409, f"{operation['name']} is still running")
 
 
-@app.post("/v1/prepare", status_code=202)
-async def v1_prepare(req: StartReq):
+@app.post("/internal/prepare", status_code=202)
+async def internal_prepare(req: StartReq):
     _need_idle()
     m = await _new_migration(req)
     return _begin("prepare", m.start(req.budget_ms, req.timeout_s))
 
 
-@app.post("/v1/execute", status_code=202)
-async def v1_execute(req: CutoverReq = CutoverReq()):
+@app.post("/internal/execute", status_code=202)
+async def internal_execute(req: CutoverReq = CutoverReq()):
     _need_idle()
     return _begin("execute", _need_current().cutover(req.budget_ms))
 
 
-@app.post("/v1/rollback", status_code=202)
-async def v1_rollback(req: RollbackReq = RollbackReq()):
+@app.post("/internal/rollback", status_code=202)
+async def internal_rollback(req: RollbackReq = RollbackReq()):
     _need_idle()
     return _begin("rollback", _need_current().rollback(req.mode, req.budget_ms))
 
 
-@app.post("/v1/commit", status_code=202)
-async def v1_commit():
+@app.post("/internal/commit", status_code=202)
+async def internal_commit():
     _need_idle()
     return _begin("commit", _need_current().commit())
 
 
-@app.post("/v1/abort", status_code=202)
-async def v1_abort():
+@app.post("/internal/abort", status_code=202)
+async def internal_abort():
     _need_idle()
     return _begin("abort", _need_current().abort())
 
 
-@app.get("/v1/status")
-async def v1_status():
+@app.get("/internal/status")
+async def internal_status():
     running = operation and operation["state"] == "running"
     m = current
     ready = False
