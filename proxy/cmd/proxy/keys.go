@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 
 	"statemig/internal/redisx"
@@ -50,6 +51,9 @@ const cachePrefix = "cache:"
 
 func isCacheKey(key []byte) bool { return bytes.HasPrefix(key, []byte(cachePrefix)) }
 
+// pendingKey names a cache key with its db: the same name in another db is another key.
+func pendingKey(db int, key []byte) string { return strconv.Itoa(db) + ":" + string(key) }
+
 func cacheMiss(resp3 bool) []byte {
 	if resp3 {
 		return []byte("_\r\n")
@@ -62,11 +66,11 @@ func cacheMiss(resp3 bool) []byte {
 // is a miss and cache-aside reads the DB. A fill is dropped, since one held until RESUME
 // could land after the DEL of a commit made in the pause. A key stays pending until its
 // held write has run, which can be just after RESUME. nil = not answered here.
-func cacheReply(name string, args [][]byte, resp3, paused bool, pending map[string]int) []byte {
+func cacheReply(name string, args [][]byte, db int, resp3, paused bool, pending map[string]int) []byte {
 	if len(args) < 2 || !isCacheKey(args[1]) {
 		return nil
 	}
-	held := pending[string(args[1])] > 0
+	held := pending[pendingKey(db, args[1])] > 0
 	switch name {
 	case "get":
 		if held {
@@ -141,22 +145,6 @@ var (
 	deniedCmds = set("flushall", "flushdb", "keys", "config", "swapdb", "move")
 	pubsubCmds = set("subscribe", "psubscribe", "ssubscribe", "monitor")
 )
-
-// otherDB reports a command that would reach a db other than 0: only db 0 is synced, so a
-// write there would be left behind by a migration without any error.
-func otherDB(name string, args [][]byte) bool {
-	switch name {
-	case "select":
-		return len(args) != 2 || string(args[1]) != "0"
-	case "copy": // COPY src dst [DB n] [REPLACE]
-		for i := 3; i < len(args); i++ {
-			if strings.EqualFold(string(args[i]), "db") {
-				return true
-			}
-		}
-	}
-	return false
-}
 
 func set(xs ...string) map[string]bool {
 	m := map[string]bool{}

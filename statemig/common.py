@@ -152,7 +152,7 @@ class CommonApi:
         return {"kind": "REDIS", "profiles": [{
             "profile": PROFILE, "resources": [f"resource:{n}" for n in self.endpoints], "bindings": [BINDING],
             "actions": ACTIONS, "rollbackModes": ["REVERSE_REQUIRED"],
-            "constraints": ["no Redis Cluster", "db 0 only", "keyspace notifications required", "same engine family",
+            "constraints": ["no Redis Cluster", "each db keeps its number; queues in db 0", "keyspace notifications required", "same engine family",
                             "QUIESCE checks only; CUTOVER holds, switches and resumes writes in one command",
                             "ROLLBACK mode=failure accepts the loss of what the reverse sync had not copied"],
         }]}

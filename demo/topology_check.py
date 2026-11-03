@@ -1,4 +1,5 @@
-"""The precheck refuses what it cannot move whole: a cluster, and keys outside db 0 (run on the host).
+"""The precheck refuses what it cannot move whole (run on the host): a cluster, a db the other side
+does not have (each db keeps its number), and queue streams outside db 0.
 
   python demo/topology_check.py
 
@@ -16,7 +17,8 @@ from statemig.backend import Endpoint  # noqa: E402
 from statemig.migration import Migration  # noqa: E402
 
 IMAGE = "valkey/valkey:8"
-NODES = {"plain-a": (16391, []), "plain-b": (16392, []), "cluster": (16393, ["--cluster-enabled", "yes"])}
+NODES = {"plain-a": (16391, []), "plain-b": (16392, []), "cluster": (16393, ["--cluster-enabled", "yes"]),
+         "two-dbs": (16394, ["--databases", "2"])}
 results: list[bool] = []
 
 
@@ -61,7 +63,13 @@ async def wait_up():
 async def topology_errors(src: str, dst: str) -> list[str]:
     m = Migration(None, None, None, ep(src), ep(dst), "default")
     r = await m.precheck()
-    return [e for e in r["errors"] if "cluster mode" in e or "outside db 0" in e]
+    return [e for e in r["errors"] if "cluster mode" in e or " db " in e or "outside db 0" in e]
+
+
+async def put(name: str, db: int, *cmd):
+    c = aioredis.Redis(host="127.0.0.1", port=NODES[name][0], db=db)
+    await c.execute_command(*cmd)
+    await c.aclose()
 
 
 async def main():
@@ -76,13 +84,17 @@ async def main():
         errs = await topology_errors("cluster", "plain-b")
         report("원본이 cluster 모드 → 거부", errs == ["cluster mode is not supported on source"], errs)
 
-        c = aioredis.Redis(host="127.0.0.1", port=NODES["plain-a"][0], db=5)
-        await c.set("session:in-db5", "1")
-        await c.aclose()
+        await put("plain-a", 5, "SET", "session:in-db5", "1")
         errs = await topology_errors("plain-a", "plain-b")
-        report("원본 db 5에 키 → 거부", errs == ["keys outside db 0 (db5): only db 0 is migrated on source"], errs)
-        errs = await topology_errors("plain-b", "plain-a")
-        report("대상 db 5에 키 → 거부", errs == ["keys outside db 0 (db5): only db 0 is migrated on target"], errs)
+        report("원본 db 5에 키, 대상도 db 5 있음 → 거부 없음", errs == [], errs)
+        errs = await topology_errors("plain-a", "two-dbs")
+        report("원본 db 5에 키, 대상은 db 2개 → 거부", errs == ["source has keys in db 5, target has no db 5"], errs)
+        errs = await topology_errors("two-dbs", "plain-a")
+        report("대상 db 5에 키, 원본은 db 2개 → 거부 (역방향)", errs == ["target has keys in db 5, source has no db 5"], errs)
+
+        await put("plain-b", 3, "XADD", "q:join", "*", "request_id", "x")
+        errs = await topology_errors("plain-a", "plain-b")
+        report("큐 스트림이 db 3에 있음 → 거부", errs == ["queue streams outside db 0 on target: ['db3/q:join']"], errs)
     finally:
         stop()
     failed = results.count(False)

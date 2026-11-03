@@ -278,10 +278,31 @@ func sameKey(a, d *redisx.Conn, key string) (bool, error) {
 	return true, nil
 }
 
-// compareKeys returns the keys that differ, a batch per round trip. Equal DUMP
-// bytes settle it; anything else gets the per-type comparison, since the same
-// value can have a different encoding.
+// compareKeys returns the tracked keys (db and name) that differ, db by db.
 func (s *Syncer) compareKeys(src, dst *redisx.Conn, keys []string) ([]string, error) {
+	var bad []string
+	for db, group := range groupByDB(keys) {
+		if err := src.Select(db); err != nil {
+			return nil, err
+		}
+		if err := dst.Select(db); err != nil {
+			return nil, err
+		}
+		b, err := s.compareGroup(src, dst, group)
+		if err != nil {
+			return nil, err
+		}
+		for _, k := range b {
+			bad = append(bad, dkey(db, k))
+		}
+	}
+	return bad, nil
+}
+
+// compareGroup returns the keys of the current db that differ, a batch per round trip. Equal
+// DUMP bytes settle it; anything else gets the per-type comparison, since the same value can
+// have a different encoding.
+func (s *Syncer) compareGroup(src, dst *redisx.Conn, keys []string) ([]string, error) {
 	var bad []string
 	if s.logical.Load() {
 		for _, k := range keys {
@@ -362,11 +383,27 @@ func (s *Syncer) verifyDelta(src *redisx.Conn, req VerifyReq) (map[string]*prefi
 		return nil, false, err
 	}
 	out["delta"] = r
+	dbs, err := dbsOf(src)
+	if err != nil {
+		return nil, false, err
+	}
 	for p, n := range req.Sample {
 		pr := &prefixReport{Mode: fmt.Sprintf("sample %d", n)}
-		sample, err := scanKeys(src, p, n)
-		if err != nil {
-			return nil, false, err
+		var sample []string
+		for _, db := range dbs { // n in all, from the dbs in turn
+			if len(sample) >= n {
+				break
+			}
+			if err := src.Select(db); err != nil {
+				return nil, false, err
+			}
+			ks, err := scanKeys(src, p, n-len(sample))
+			if err != nil {
+				return nil, false, err
+			}
+			for _, k := range ks {
+				sample = append(sample, dkey(db, k))
+			}
 		}
 		if err := compare(sample, pr); err != nil {
 			return nil, false, err
@@ -382,41 +419,59 @@ func (s *Syncer) verifyDelta(src *redisx.Conn, req VerifyReq) (map[string]*prefi
 func (s *Syncer) verifyCount(req VerifyReq) (map[string]*prefixReport, bool, error) {
 	srcEP, dstEP, _ := s.dir()
 	before := s.marked.Load()
-	out := map[string]*prefixReport{}
-	for p := range req.Sample {
-		out[p] = &prefixReport{Mode: "count"}
-	}
-	count := func(ep *redisx.Endpoint, field func(*prefixReport) *int) error {
+	// Counted per db and prefix: a key moved between dbs must not cancel out in a total.
+	count := func(ep *redisx.Endpoint) (map[string]int, error) {
 		c, err := ep.Dial(0)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer c.Close()
-		return s.scanIncluded(c, func(keys []string) error {
+		dbs, err := dbsOf(c)
+		if err != nil {
+			return nil, err
+		}
+		n := map[string]int{}
+		err = s.scanDBs(c, dbs, func(db int, keys []string) error {
 			for _, k := range keys {
-				for p, pr := range out {
+				for p := range req.Sample {
 					if strings.HasPrefix(k, p) {
-						*field(pr)++
+						n[prefixLabel(db, p)]++
 					}
 				}
 			}
 			return nil
 		})
+		return n, err
 	}
 	var wg sync.WaitGroup
+	var srcN, dstN map[string]int
 	var srcErr, dstErr error
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		srcErr = count(srcEP, func(r *prefixReport) *int { return &r.SrcKeys })
+		srcN, srcErr = count(srcEP)
 	}()
 	go func() {
 		defer wg.Done()
-		dstErr = count(dstEP, func(r *prefixReport) *int { return &r.DstKeys })
+		dstN, dstErr = count(dstEP)
 	}()
 	wg.Wait()
 	if err := errors.Join(srcErr, dstErr); err != nil {
 		return nil, false, err
+	}
+	out := map[string]*prefixReport{}
+	for p := range req.Sample {
+		out[p] = &prefixReport{Mode: "count"}
+	}
+	for _, n := range []map[string]int{srcN, dstN} {
+		for label := range n {
+			if out[label] == nil {
+				out[label] = &prefixReport{Mode: "count"}
+			}
+		}
+	}
+	for label, pr := range out {
+		pr.SrcKeys, pr.DstKeys = srcN[label], dstN[label]
 	}
 	waiting, _ := s.Backlog()
 	slack := int(s.marked.Load()-before) + waiting
@@ -458,15 +513,44 @@ func (s *Syncer) Verify(req VerifyReq) (map[string]*prefixReport, bool, error) {
 		}
 		return xs
 	}
+	dbs, err := dbsOf(src, dst)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, db := range dbs {
+		if err := src.Select(db); err != nil {
+			return nil, false, err
+		}
+		if err := dst.Select(db); err != nil {
+			return nil, false, err
+		}
+		if err := s.verifyFull(src, dst, req, db, deadline, out, &ok, add); err != nil {
+			return nil, false, err
+		}
+	}
+	return out, ok, nil
+}
+
+// prefixLabel names a report row: the prefix for db 0, "db3/session:" for another db.
+func prefixLabel(db int, p string) string {
+	if db == 0 {
+		return p
+	}
+	return fmt.Sprintf("db%d/%s", db, p)
+}
+
+// verifyFull is the full-mode VERIFY of one db; both connections are on it.
+func (s *Syncer) verifyFull(src, dst *redisx.Conn, req VerifyReq, db int, deadline time.Time,
+	out map[string]*prefixReport, ok *bool, add func([]string, string) []string) error {
 	for _, p := range req.Full {
 		r := &prefixReport{Mode: "full"}
 		sk, err := scanKeys(src, p, 0)
 		if err != nil {
-			return nil, false, err
+			return err
 		}
 		dk, err := scanKeys(dst, p, 0)
 		if err != nil {
-			return nil, false, err
+			return err
 		}
 		r.SrcKeys, r.DstKeys = len(sk), len(dk)
 		inSrc := map[string]bool{}
@@ -475,58 +559,58 @@ func (s *Syncer) Verify(req VerifyReq) (map[string]*prefixReport, bool, error) {
 		}
 		for _, k := range dk {
 			if !inSrc[k] {
-				r.OnlyInDst = add(r.OnlyInDst, k)
-				ok = false
+				r.OnlyInDst = add(r.OnlyInDst, dkey(db, k))
+				*ok = false
 			}
 		}
 		for i := 0; i < len(sk); i += verifyBatch {
 			if past(deadline) {
-				return nil, false, errDeadline
+				return errDeadline
 			}
 			group := sk[i:min(i+verifyBatch, len(sk))]
-			bad, err := s.compareKeys(src, dst, group)
+			bad, err := s.compareGroup(src, dst, group)
 			if err != nil {
-				return nil, false, err
+				return err
 			}
 			r.Compared += len(group)
 			for _, k := range bad {
-				r.Mismatched = add(r.Mismatched, k)
-				ok = false
+				r.Mismatched = add(r.Mismatched, dkey(db, k))
+				*ok = false
 			}
 		}
-		out[p] = r
+		out[prefixLabel(db, p)] = r
 	}
 	for p, n := range req.Sample {
 		r := &prefixReport{Mode: fmt.Sprintf("sample %d", n)}
 		sk, err := scanKeys(src, p, 0)
 		if err != nil {
-			return nil, false, err
+			return err
 		}
 		dk, err := scanKeys(dst, p, 0)
 		if err != nil {
-			return nil, false, err
+			return err
 		}
 		r.SrcKeys, r.DstKeys = len(sk), len(dk)
 		if diff, tol := abs(len(sk)-len(dk)), max(2, len(sk)/100); diff > tol {
 			r.CountDiff = len(dk) - len(sk)
-			ok = false
+			*ok = false
 		}
 		if len(sk) > n {
 			sk = sk[:n]
 		}
 		for i := 0; i < len(sk); i += verifyBatch {
 			group := sk[i:min(i+verifyBatch, len(sk))]
-			bad, err := s.compareKeys(src, dst, group)
+			bad, err := s.compareGroup(src, dst, group)
 			if err != nil {
-				return nil, false, err
+				return err
 			}
 			r.Compared += len(group)
 			for _, k := range bad {
-				r.Mismatched = add(r.Mismatched, k)
-				ok = false
+				r.Mismatched = add(r.Mismatched, dkey(db, k))
+				*ok = false
 			}
 		}
-		out[p] = r
+		out[prefixLabel(db, p)] = r
 	}
-	return out, ok, nil
+	return nil
 }

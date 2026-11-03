@@ -58,7 +58,7 @@ type Proxy struct {
 	tx       int // sessions inside MULTI/WATCH
 	sessions map[*session]struct{}
 	blockCap int // ms; caps XREADGROUP BLOCK while consume != active
-	// cache keys with a write held at the gate and not finished yet, with how many
+	// cache keys ("db:key") with a write held at the gate and not finished yet, with how many
 	pendingCache map[string]int
 
 	upstreamTimeout time.Duration // per-command I/O deadline towards a backend
@@ -145,11 +145,11 @@ func (p *Proxy) Route() (Route, bool) {
 // A cache command around a PAUSE may be answered here (the last result), under the same
 // lock, so a fill can't slip past the check and end up held instead of dropped. The third
 // last result lists the cache keys this command holds as pending; pass it back to exit.
-func (p *Proxy) enter(name string, args [][]byte, inTx, resp3 bool) (Route, uint64, bool, []byte, []string) {
+func (p *Proxy) enter(name string, args [][]byte, db int, inTx, resp3 bool) (Route, uint64, bool, []byte, []string) {
 	held := !inTx && !consumeCmds[name] && p.cmds.Held(name)
 	p.mu.Lock()
 	if !inTx && (p.paused || len(p.pendingCache) > 0) {
-		if reply := cacheReply(name, args, resp3, p.paused, p.pendingCache); reply != nil {
+		if reply := cacheReply(name, args, db, resp3, p.paused, p.pendingCache); reply != nil {
 			p.mu.Unlock()
 			return Route{}, 0, false, reply, nil
 		}
@@ -158,8 +158,9 @@ func (p *Proxy) enter(name string, args [][]byte, inTx, resp3 bool) (Route, uint
 	if held && p.paused {
 		for _, k := range p.keys.keysOf(name, args) {
 			if isCacheKey(k) {
-				pending = append(pending, string(k))
-				p.pendingCache[string(k)]++
+				pk := pendingKey(db, k)
+				pending = append(pending, pk)
+				p.pendingCache[pk]++
 			}
 		}
 		p.Stats.HeldCommands.Add(1)
@@ -419,10 +420,6 @@ func (s *session) run() {
 			p.Stats.Denied.Add(1)
 			s.reply(redisx.ErrorReply("ERR " + name + " is not allowed through the proxy"))
 			continue
-		case otherDB(name, args):
-			p.Stats.Denied.Add(1)
-			s.reply(redisx.ErrorReply("ERR only db 0 is supported through the proxy"))
-			continue
 		case name == "hello":
 			// Backend auth is the proxy's job: check AUTH against the proxy password,
 			// strip it, and remember the rest so it's replayed on every new upstream.
@@ -444,7 +441,7 @@ func (s *session) run() {
 
 		t0 := time.Now() // includes time at the gate: the pause shows up in latency honestly
 		wasTx := s.inTx()
-		route, epoch, held, answered, pending := p.enter(name, args, wasTx, s.resp3())
+		route, epoch, held, answered, pending := p.enter(name, args, s.db, wasTx, s.resp3())
 		if answered != nil {
 			p.Stats.CacheBypassed.Add(1)
 			s.reply(answered)

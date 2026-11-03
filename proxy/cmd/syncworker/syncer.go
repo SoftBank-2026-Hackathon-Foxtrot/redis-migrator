@@ -34,6 +34,7 @@ import (
 	"errors"
 	"hash/fnv"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,8 +45,8 @@ import (
 )
 
 const (
-	notifyPrefix = "__keyspace@0__:"
-	barrierKey   = "__statemig:barrier"
+	notifyPattern = "__keyspace@*__:*" // every db, on one connection: the events of all dbs arrive in order
+	barrierKey    = "__statemig:barrier"
 	heartbeatKey = "__statemig:heartbeat"
 	copyBatch    = 100 // keys per round trip, per worker
 	minKeptPct   = 90  // a restarted src must still hold this share of dst's keys
@@ -132,6 +133,92 @@ func (s *Syncer) included(key string) bool {
 	return false
 }
 
+// A tracked key carries its db, which a migration keeps: "3:session:abc" is session:abc in db 3
+// on both sides. Barrier and heartbeat live in db 0.
+func dkey(db int, key string) string { return strconv.Itoa(db) + ":" + key }
+
+func splitKey(k string) (int, string) {
+	i := strings.IndexByte(k, ':')
+	db, _ := strconv.Atoi(k[:i])
+	return db, k[i+1:]
+}
+
+// parseNotify reads "__keyspace@3__:session:abc".
+func parseNotify(channel string) (int, string, bool) {
+	rest, ok := strings.CutPrefix(channel, "__keyspace@")
+	if !ok {
+		return 0, "", false
+	}
+	i := strings.Index(rest, "__:")
+	if i < 0 {
+		return 0, "", false
+	}
+	db, err := strconv.Atoi(rest[:i])
+	if err != nil {
+		return 0, "", false
+	}
+	return db, rest[i+3:], true
+}
+
+// keyspaceDBs lists the dbs that hold keys, from INFO keyspace.
+func keyspaceDBs(c *redisx.Conn) ([]int, error) {
+	v, err := c.DoStr("INFO", "keyspace")
+	if err != nil {
+		return nil, err
+	}
+	var out []int
+	for _, line := range strings.Split(string(v.Str), "\n") {
+		name, _, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if n, err := strconv.Atoi(strings.TrimPrefix(name, "db")); ok && strings.HasPrefix(name, "db") && err == nil {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+// dbsOf is every db that holds keys on any of the connections, db 0 always included.
+func dbsOf(conns ...*redisx.Conn) ([]int, error) {
+	seen := map[int]bool{0: true}
+	for _, c := range conns {
+		dbs, err := keyspaceDBs(c)
+		if err != nil {
+			return nil, err
+		}
+		for _, db := range dbs {
+			seen[db] = true
+		}
+	}
+	out := make([]int, 0, len(seen))
+	for db := range seen {
+		out = append(out, db)
+	}
+	sort.Ints(out)
+	return out, nil
+}
+
+// groupByDB splits tracked keys into raw key names per db.
+func groupByDB(keys []string) map[int][]string {
+	out := map[int][]string{}
+	for _, k := range keys {
+		db, key := splitKey(k)
+		out[db] = append(out[db], key)
+	}
+	return out
+}
+
+// scanDBs runs scanIncluded on each db in turn; the connection is left on the last one.
+func (s *Syncer) scanDBs(c *redisx.Conn, dbs []int, fn func(int, []string) error) error {
+	for _, db := range dbs {
+		if err := c.Select(db); err != nil {
+			return err
+		}
+		if err := s.scanIncluded(c, func(keys []string) error { return fn(db, keys) }); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Syncer) shardOf(key string) *shard {
 	h := fnv.New32a()
 	h.Write([]byte(key))
@@ -215,9 +302,14 @@ func (s *Syncer) scanIncluded(c *redisx.Conn, fn func([]string) error) error {
 	}
 }
 
+// countKeys counts the included keys of every db.
 func (s *Syncer) countKeys(c *redisx.Conn) (int, error) {
+	dbs, err := dbsOf(c)
+	if err != nil {
+		return 0, err
+	}
 	n := 0
-	err := s.scanIncluded(c, func(keys []string) error {
+	err = s.scanDBs(c, dbs, func(_ int, keys []string) error {
 		n += len(keys)
 		return nil
 	})
@@ -379,7 +471,7 @@ func (s *Syncer) subscriber(src *redisx.Endpoint, epoch uint64, confirmed chan s
 			err = s.checkSource(c, src)
 		}
 		if err == nil {
-			redisx.WriteCommand(c.Writer(), redisx.B("PSUBSCRIBE"), redisx.B(notifyPrefix+"*"))
+			redisx.WriteCommand(c.Writer(), redisx.B("PSUBSCRIBE"), redisx.B(notifyPattern))
 			if err = c.Writer().Flush(); err == nil {
 				var v redisx.Value
 				if v, err = redisx.ReadValue(c.Reader()); err == nil && v.IsErr() { // ["psubscribe", pattern, 1]
@@ -422,14 +514,17 @@ func (s *Syncer) subscriber(src *redisx.Endpoint, epoch uint64, confirmed chan s
 				break
 			}
 			if len(v.Arr) == 4 && string(v.Arr[0].Str) == "pmessage" {
-				key := strings.TrimPrefix(string(v.Arr[2].Str), notifyPrefix)
+				db, key, ok := parseNotify(string(v.Arr[2].Str))
+				if !ok {
+					continue
+				}
 				s.notifications.Add(1)
-				if key == barrierKey {
+				if db == 0 && key == barrierKey {
 					s.barrierArrived()
-				} else if key == heartbeatKey {
+				} else if db == 0 && key == heartbeatKey {
 					s.beatArrived()
 				} else if s.included(key) {
-					s.Mark(key)
+					s.Mark(dkey(db, key))
 				}
 			}
 		}
@@ -460,10 +555,14 @@ func (s *Syncer) FullScan() (int, error) {
 		return 0, err
 	}
 	defer dst.Close()
+	dbs, err := dbsOf(src, dst)
+	if err != nil {
+		return 0, err
+	}
 	n := 0
-	err = s.scanIncluded(src, func(keys []string) error {
+	err = s.scanDBs(src, dbs, func(db int, keys []string) error {
 		for _, k := range keys {
-			s.Mark(k)
+			s.Mark(dkey(db, k))
 		}
 		n += len(keys)
 		return nil
@@ -471,10 +570,10 @@ func (s *Syncer) FullScan() (int, error) {
 	if err != nil {
 		return n, err
 	}
-	err = s.scanIncluded(dst, func(keys []string) error {
-		only, err := missingOn(src, keys)
+	err = s.scanDBs(dst, dbs, func(db int, keys []string) error {
+		only, err := missingOn(src, db, keys)
 		for _, k := range only {
-			s.Mark(k)
+			s.Mark(dkey(db, k))
 		}
 		n += len(only)
 		return err
@@ -486,8 +585,11 @@ func (s *Syncer) FullScan() (int, error) {
 	return n, nil
 }
 
-// missingOn returns the keys c does not have.
-func missingOn(c *redisx.Conn, keys []string) ([]string, error) {
+// missingOn returns the keys db on c does not have.
+func missingOn(c *redisx.Conn, db int, keys []string) ([]string, error) {
+	if err := c.Select(db); err != nil {
+		return nil, err
+	}
 	cmds := make([][][]byte, len(keys))
 	for i, k := range keys {
 		cmds[i] = [][]byte{b("EXISTS"), []byte(k)}
@@ -637,10 +739,10 @@ func (s *Syncer) worker(sh *shard) {
 			return
 		}
 		batch := map[string]int64{}
-		keys := make([][]byte, 0, copyBatch)
+		keys := make([]string, 0, copyBatch)
 		for k, t := range sh.dirty {
 			batch[k] = t
-			keys = append(keys, []byte(k))
+			keys = append(keys, k)
 			delete(sh.dirty, k) // before reading src: a write after this point marks it again
 			if len(keys) == copyBatch {
 				break
@@ -649,7 +751,19 @@ func (s *Syncer) worker(sh *shard) {
 		sh.copying += len(keys)
 		sh.mu.Unlock()
 
-		copied, deleted, err := cp.copyMany(keys)
+		copied, deleted, err := 0, 0, error(nil)
+		for db, group := range groupByDB(keys) {
+			raw := make([][]byte, len(group))
+			for i, k := range group {
+				raw[i] = []byte(k)
+			}
+			c, d, e := cp.copyMany(db, raw)
+			copied, deleted = copied+c, deleted+d
+			if e != nil {
+				err = e
+				break
+			}
+		}
 
 		sh.mu.Lock()
 		sh.copying -= len(keys)
@@ -905,19 +1019,27 @@ func (s *Syncer) Precompare(deadline time.Time) (map[string]any, error) {
 	// A key that differs is marked, so it stays remembered until it is copied and compared:
 	// nothing needs to be level when this pass ends.
 	differed := 0
+	dbs, err := dbsOf(src, dst)
+	if err != nil {
+		return nil, err
+	}
 	cmp := s.newComparer(deadline)
-	err = s.scanIncluded(src, func(keys []string) error {
+	err = s.scanDBs(src, dbs, func(db int, keys []string) error {
 		for i := 0; i < len(keys); i += verifyBatch {
-			cmp.Submit(keys[i:min(i+verifyBatch, len(keys))])
+			group := make([]string, 0, verifyBatch)
+			for _, k := range keys[i:min(i+verifyBatch, len(keys))] {
+				group = append(group, dkey(db, k))
+			}
+			cmp.Submit(group)
 		}
 		return nil
 	})
 	if err == nil {
-		err = s.scanIncluded(dst, func(keys []string) error { // keys only on dst
-			only, err := missingOn(src, keys)
+		err = s.scanDBs(dst, dbs, func(db int, keys []string) error { // keys only on dst
+			only, err := missingOn(src, db, keys)
 			differed += len(only)
 			for _, k := range only {
-				s.Mark(k)
+				s.Mark(dkey(db, k))
 			}
 			return err
 		})
@@ -1043,10 +1165,16 @@ func (c *copier) reset() {
 
 func (c *copier) close() { c.reset() }
 
-// copyMany copies keys in as few round trips as it can.
-func (c *copier) copyMany(keys [][]byte) (copied, deleted int, err error) {
+// copyMany copies keys of one db in as few round trips as it can.
+func (c *copier) copyMany(db int, keys [][]byte) (copied, deleted int, err error) {
 	src, dst, err := c.conns()
 	if err != nil {
+		return 0, 0, err
+	}
+	if err := src.Select(db); err != nil {
+		return 0, 0, err
+	}
+	if err := dst.Select(db); err != nil {
 		return 0, 0, err
 	}
 	if !c.s.logical.Load() {

@@ -55,6 +55,7 @@ type Conn struct {
 	nc net.Conn
 	r  *bufio.Reader
 	w  *bufio.Writer
+	db int // the db this connection is on, as far as Select knows
 }
 
 func (e *Endpoint) Dial(db int) (*Conn, error) {
@@ -80,13 +81,23 @@ func (e *Endpoint) Dial(db int) (*Conn, error) {
 			return nil, fmt.Errorf("auth %s: %w", e.Name, err)
 		}
 	}
-	if db != 0 {
-		if _, err := c.DoStr("SELECT", strconv.Itoa(db)); err != nil {
-			c.Close()
-			return nil, err
-		}
+	if err := c.Select(db); err != nil {
+		c.Close()
+		return nil, err
 	}
 	return c, nil
+}
+
+// Select moves the connection to db, sending SELECT only when it is on another one.
+func (c *Conn) Select(db int) error {
+	if c.db == db {
+		return nil
+	}
+	if _, err := c.DoStr("SELECT", strconv.Itoa(db)); err != nil {
+		return err
+	}
+	c.db = db
+	return nil
 }
 
 func (c *Conn) Close() error { return c.nc.Close() }

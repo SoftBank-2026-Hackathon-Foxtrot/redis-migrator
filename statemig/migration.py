@@ -172,7 +172,18 @@ class Migration:
             si, ti = await src.info(), await dst.info()
             r["source_version"], r["target_version"] = _version(si), _version(ti)
             for name, info in (("source", si), ("target", ti)):
-                r["errors"] += [f"{e} on {name}" for e in _topology_errors(info)]
+                if info.get("cluster_enabled"):
+                    r["errors"].append(f"cluster mode is not supported on {name}")
+            if r["errors"]:
+                return r
+            # A db keeps its number on the other side, in both directions (the reverse sync).
+            for (a, a_info), (b, b_ep) in ((("source", si), ("target", self.target)),
+                                           (("target", ti), ("source", self.source))):
+                if (top := max(_dbs(a_info), default=0)) and not await _has_db(b_ep, top):
+                    r["errors"].append(f"{a} has keys in db {top}, {b} has no db {top}")
+            for name, ep, info in (("source", self.source, si), ("target", self.target, ti)):
+                if found := await _queues_outside_db0(ep, _dbs(info)):
+                    r["errors"].append(f"queue streams outside db 0 on {name}: {found}")
             if r["errors"]:
                 return r
             if ti.get("maxmemory") and ti["maxmemory"] < si.get("used_memory", 0):
@@ -189,7 +200,7 @@ class Migration:
                 if r["fence"][ep.name] == "isolated":
                     r["warnings"].append(f"ACL refused on {name}: only credential isolation fences it")
             r["copy_mode"] = await _probe_dump(src, dst)
-            r["estimate"] = await _estimate(src, dst, budget_ms, self.mode)
+            r["estimate"] = await _estimate(self.source, _dbs(si), src, dst, budget_ms, self.mode)
             if r["estimate"]["ms"] > budget_ms:
                 r["errors"].append(f"estimated final reconcile {r['estimate']['ms']}ms > budget {budget_ms}ms")
         finally:
@@ -765,16 +776,37 @@ def _why(e: Exception) -> str:
     return str(e) or type(e).__name__
 
 
-def _topology_errors(info: dict) -> list[str]:
-    """What this migrator cannot move whole: a cluster (one node holds only some slots) and keys
-    outside db 0 (notifications, scans and copies all work on db 0 only)."""
-    errors = []
-    if info.get("cluster_enabled"):
-        errors.append("cluster mode is not supported")
-    other = sorted((k for k in info if k.startswith("db") and k[2:].isdigit() and k != "db0"), key=lambda k: int(k[2:]))
-    if other:
-        errors.append(f"keys outside db 0 ({', '.join(other)}): only db 0 is migrated")
-    return errors
+def _dbs(info: dict) -> list[int]:
+    """The dbs that hold keys, from INFO keyspace."""
+    return sorted(int(k[2:]) for k in info if k.startswith("db") and k[2:].isdigit())
+
+
+async def _has_db(ep: Endpoint, db: int) -> bool:
+    """Whether this Redis has that db: SELECT fails past its `databases` (CONFIG may be refused)."""
+    c = ep.client(db)
+    try:
+        await c.ping()
+        return True
+    except ResponseError:
+        return False
+    finally:
+        await c.aclose()
+
+
+async def _queues_outside_db0(ep: Endpoint, dbs: list[int]) -> list[str]:
+    """The queue drain and the group checks work on db 0: streams elsewhere would be left behind."""
+    found = []
+    for db in dbs:
+        if db == 0:
+            continue
+        c = ep.client(db)
+        try:
+            for s in STREAMS:
+                if await c.exists(s):
+                    found.append(f"db{db}/{s}")
+        finally:
+            await c.aclose()
+    return found
 
 
 def _version(info: dict) -> str:
@@ -849,13 +881,17 @@ async def _rtt_ms(c, n: int = 5) -> float:
     return (time.perf_counter() - t0) * 1000 / n
 
 
-async def _estimate(src, dst, budget_ms: int, mode: str) -> dict:
+async def _estimate(src_ep: Endpoint, dbs: list[int], src, dst, budget_ms: int, mode: str) -> dict:
     """Final reconcile + VERIFY, from the key counts and measured round trips (a batch per round trip)."""
-    counts = {}
-    for p in SYNC_PREFIXES:
-        counts[p] = 0
-        async for _ in src.scan_iter(match=p + "*", count=1000):
-            counts[p] += 1
+    counts = {p: 0 for p in SYNC_PREFIXES}
+    for db in dbs or [0]:
+        c = src_ep.client(db)
+        try:
+            for p in SYNC_PREFIXES:
+                async for _ in c.scan_iter(match=p + "*", count=1000):
+                    counts[p] += 1
+        finally:
+            await c.aclose()
     rs, rd = await _rtt_ms(src), await _rtt_ms(dst)
     keys = sum(counts.values())
     if mode == "delta":     # what is left at the pause, a sample per prefix, and counting keys
@@ -922,11 +958,18 @@ async def _queues_empty(c) -> bool:
 
 
 async def _drop_prefix(ep: Endpoint, prefix: str) -> int:
+    """In every db: a db keeps its number across a migration, and so does its cache."""
     c = ep.client()
-    n = 0
     try:
-        async for k in c.scan_iter(match=prefix + "*", count=1000):
-            n += await c.delete(k)
+        dbs = _dbs(await c.info("keyspace"))
     finally:
         await c.aclose()
+    n = 0
+    for db in dbs:
+        c = ep.client(db)
+        try:
+            async for k in c.scan_iter(match=prefix + "*", count=1000):
+                n += await c.delete(k)
+        finally:
+            await c.aclose()
     return n
