@@ -35,9 +35,13 @@ from .backend import Endpoint
 
 log = logging.getLogger("statemig.migration")
 
-SYNC_PREFIXES = ["session:", "cache:", "q:delayed"]
-VERIFY = {"full": ["session:", "q:delayed"], "sample": {"cache:": 200}}
-VERIFY_DELTA = {"mode": "delta", "sample": {"session:": 200, "cache:": 200, "q:delayed": 200}}
+# Dead-letter streams are copied like any key: no consumer group reads them, so there is nothing
+# to drain, and they must not stay behind on the old Redis once that is decommissioned.
+DEAD_STREAMS = ["q:join:dead", "q:notify:dead"]
+SYNC_PREFIXES = ["session:", "cache:", "q:delayed", *DEAD_STREAMS]
+VERIFY = {"full": ["session:", "q:delayed", *DEAD_STREAMS], "sample": {"cache:": 200}}
+VERIFY_DELTA = {"mode": "delta", "sample": {"session:": 200, "cache:": 200, "q:delayed": 200,
+                                            **{d: 200 for d in DEAD_STREAMS}}}
 STREAMS = ["q:join", "q:notify"]
 GROUP = "workers"
 CONSUME_CMDS = "+xreadgroup +xack +xautoclaim +xclaim"
@@ -188,6 +192,12 @@ class Migration:
                 return r
             if ti.get("maxmemory") and ti["maxmemory"] < si.get("used_memory", 0):
                 r["errors"].append("target maxmemory < source used_memory")
+            # An evicted key is gone from that side only: compares fail and a rollback misses it.
+            # Both sides count, since the source is written by the reverse sync after a cutover.
+            for name, info in (("source", si), ("target", ti)):
+                if info.get("maxmemory") and info.get("maxmemory_policy", "noeviction") != "noeviction":
+                    r["errors"].append(f"maxmemory-policy {info['maxmemory_policy']} on {name} can evict keys:"
+                                       " set noeviction")
             for ep, name, c in ((self.source, "source", src), (self.target, "target", dst)):
                 r["warnings"] += [f"{w} on {name}" for w in await _restart_risks(c)]
                 try:
@@ -265,7 +275,8 @@ class Migration:
         if self.mode == "delta" and not s["compare_valid"]:
             return "full compare not finished"
         if s["stable_ms"] < READY_STABLE_MS:
-            return f"sync not keeping up for {READY_STABLE_MS}ms yet (lag {s['lag_ms']}ms, backlog {s['backlog']})"
+            return (f"sync not keeping up for {READY_STABLE_MS}ms yet (lag {s['lag_ms']}ms, backlog {s['backlog']}, "
+                    f"oldest waiting {s['oldest_dirty_age_ms']}ms)")
         if s["est_verify_ms"] > READY_VERIFY_MS:
             return f"{s['delta_keys']} changed keys still to compare (about {s['est_verify_ms']}ms)"
         return None
@@ -556,6 +567,11 @@ class Migration:
             else:
                 res["reverse_backlog_at_failure"] = st.get("backlog")
                 res["reverse_oldest_dirty_age_ms"] = st.get("oldest_dirty_age_ms")
+                # The backlog is all that is missing only if every change was seen: not while a
+                # rescan after a dropped subscription is running, nor when the target still took
+                # writes while the subscription was down (a target that died drops it, harmlessly).
+                res["reverse_backlog_is_minimum"] = bool(st.get("rescanning") or st.get("written_while_unsubscribed"))
+                res["reverse_subscription_down_ms"] = st.get("subscription_down_ms")
         except Exception as e:  # noqa: BLE001
             res["reverse_backlog_at_failure"] = f"unknown: {_why(e)}"
         rec = self.record.read()

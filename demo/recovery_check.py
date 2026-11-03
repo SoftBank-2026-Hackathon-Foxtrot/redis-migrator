@@ -225,11 +225,11 @@ def source_back_empty():
 
 
 # ---- the proxy dies inside a switch ---------------------------------------------------------
-def proxy_dies(point: str, down_s: float, want_active: str):
+def proxy_dies(point: str, down_s: float, want_active: str, budget_ms: int = 1800):
     w = fresh()
     to_ready()
     API.post("/__hook/arm", json={"points": {point: "hold"}})
-    API.post("/internal/execute")
+    API.post("/internal/execute", json={"budget_ms": budget_ms})
     until(lambda: hook()["held"], 10, "held")
     compose("kill", "proxy")
     API.post("/__hook/release")
@@ -519,7 +519,9 @@ def main():
     safe(proxy_dies, "before:proxy:/resume#1", 1, "gcp")
     safe(proxy_dies, "before:proxy:/resume#1", 12, "gcp")
     safe(proxy_dies, "before:proxy:/switch#1", 12, "aws")
-    safe(proxy_dies, "before:sync:/reconcile#1", 1, "gcp")
+    # The switch goes forward only if the proxy is back before the budget runs out, and a restarted
+    # container takes its own time to be reachable again: a budget that leaves room for it.
+    safe(proxy_dies, "before:sync:/reconcile#1", 1, "gcp", 8000)
     safe(proxy_restarts_target_dead)
     safe(sync_worker_restarts_syncing)
     safe(sync_worker_restarts_executed)

@@ -51,9 +51,10 @@ async def call(self, method, path, body=None, timeout=30):
         return await _call(self, method, path, body, timeout)
     tag = f"{who}:{path}"
     await hit("before:" + tag)
-    res = await _call(self, method, path, body, timeout)
-    await hit("after:" + tag)
-    return res
+    try:
+        return await _call(self, method, path, body, timeout)
+    finally:   # an answered error is a finished call too: the point must not depend on the outcome
+        await hit("after:" + tag)
 
 
 def write(self, **rec):

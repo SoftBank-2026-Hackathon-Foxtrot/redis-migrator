@@ -5,7 +5,7 @@
 Fresh stack without the app. Seeds db 0, 1, 2 and 3 through the proxy, changes keys while the sync
 runs (db 5 is used for the first time then), cuts over to gcp, writes there, rolls back normally,
 and compares both sides db by db after each step. Also checks that a delete held during a pause
-makes only its own db's cache key a miss.
+makes only its own db's cache key a miss, and that the dead-letter stream follows the move.
 """
 import subprocess
 import sys
@@ -66,7 +66,7 @@ def snapshot(side: str, db: int) -> dict[bytes, bytes]:
     c = admin(side, db)
     out = {}
     for k in c.scan_iter(count=1000):
-        if k.startswith((b"session:", b"cache:", b"q:delayed")):
+        if k.startswith((b"session:", b"cache:", b"q:delayed", b"q:join:dead", b"q:notify:dead")):
             out[k] = c.dump(k)
     return out
 
@@ -115,6 +115,7 @@ def main():
         p.execute()
     app(2).set("cache:groupbuy:1", "detail", ex=300)
     app(3).zadd("q:delayed", {"job-a": 1, "job-b": 2})
+    app(0).xadd("q:join:dead", {"request_id": "poison-1", "source_id": "1-1"})
     pending_cache_is_per_db()
 
     API.post("/internal/prepare", json={"target": "gcp"})
@@ -138,9 +139,13 @@ def main():
     report("db 번호 유지: db 1 값은 gcp db 1에만", admin("gcp", 1).get("session:d1:0") == b"changed during sync"
            and admin("gcp", 0).get("session:d1:0") is None)
 
+    report("실패 큐(q:join:dead)도 대상으로 복사", admin("gcp", 0).xlen("q:join:dead") == 1)
     app(1).set("session:d1:after", "written on gcp")
+    app(0).xadd("q:join:dead", {"request_id": "poison-2", "source_id": "2-1"})
     until(lambda: admin("aws", 1).get("session:d1:after") is not None, 10, "reverse sync to aws db 1")
     report("전환 후 db 1 쓰기가 역방향으로 aws db 1에 도착", True)
+    until(lambda: admin("aws", 0).xlen("q:join:dead") == 2, 10, "reverse sync of the dead-letter stream")
+    report("전환 후 생긴 실패 메시지도 역방향으로 aws에 도착", True)
 
     API.post("/internal/rollback", json={"mode": "normal"})
     st = until(lambda: (s := API.get("/internal/status").json())["phase"] in ("rolled_back", "failed", "executed")

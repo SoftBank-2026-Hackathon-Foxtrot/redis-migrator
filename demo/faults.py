@@ -168,6 +168,29 @@ async def case_budget_too_small(ctl: Ctl):
            and m["state"] == "FAILED", m["precheck"].get("estimate"))
 
 
+async def case_copy_stalls(ctl: Ctl):
+    """Copying stops (the target refuses RESTORE) while notifications keep coming: not ready."""
+    await ctl.sync_ready()
+    async with httpx.AsyncClient(base_url=CTL, timeout=30, headers=ADMIN_HEADERS) as h:
+        ready = lambda: h.get("/migrations/current/ready")  # noqa: E731
+        await acl("gcp", "-restore", "-del")
+        try:
+            await asyncio.sleep(3)
+            stalled = (await ready()).json()["ready"]
+            st = (await ctl.status())["sync"]["sync"]
+        finally:
+            await acl("gcp", "+restore", "+del")
+        back = False
+        for _ in range(50):
+            if back := (await ready()).json()["ready"]:
+                break
+            await asyncio.sleep(0.2)
+    await ctl.post("/internal/abort")
+    await ctl.wait(lambda s: s["migration"]["state"] == "ABORTED", "abort")
+    report("복사 멈춤 → ready 꺼짐, 복구되면 다시 켜짐", not stalled and back,
+           f"멈춘 동안 ready={stalled}, 가장 오래된 대기 {st['oldest_dirty_age_ms']}ms, backlog {st['backlog']}, 복구 뒤 ready={back}")
+
+
 async def case_cache_count(ctl: Ctl):
     await ctl.sync_ready()
     c = admin("gcp")
@@ -488,6 +511,7 @@ async def main():
         await case_poison_message(ctl)
         await case_delayed_rebuilt(ctl)
         await case_budget_too_small(ctl)
+        await case_copy_stalls(ctl)
         await case_reverse_subscribe_fails(ctl, load)
         await case_fence_fails(ctl, load)
         await case_group_missing(ctl, load)

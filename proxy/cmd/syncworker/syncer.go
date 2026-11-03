@@ -47,10 +47,10 @@ import (
 const (
 	notifyPattern = "__keyspace@*__:*" // every db, on one connection: the events of all dbs arrive in order
 	barrierKey    = "__statemig:barrier"
-	heartbeatKey = "__statemig:heartbeat"
-	copyBatch    = 100 // keys per round trip, per worker
-	minKeptPct   = 90  // a restarted src must still hold this share of dst's keys
-	countBatch   = 1000
+	heartbeatKey  = "__statemig:heartbeat"
+	copyBatch     = 100 // keys per round trip, per worker
+	minKeptPct    = 90  // a restarted src must still hold this share of dst's keys
+	countBatch    = 1000
 
 	monitorEvery   = 250 * time.Millisecond
 	rollEvery      = time.Second
@@ -106,6 +106,9 @@ type Syncer struct {
 	compareRate atomic.Int64 // keys per second at the last compare
 
 	beatSent, beatLag atomic.Int64 // unix ms of the heartbeat in flight (0 = none), last round trip in ms
+	downSince         atomic.Int64 // unix ms since the subscription is down (0 = up, or never was)
+	scansRunning      atomic.Int32 // full scans in progress: until they end, the backlog is not all there is
+	writtenWhileDown  atomic.Bool  // src took a write while the subscription was down; cleared by a full rescan
 	stableSince       atomic.Int64 // unix ms since the sync has kept up (0 = it has not)
 	copyRate          atomic.Int64 // keys per second
 }
@@ -499,6 +502,7 @@ func (s *Syncer) subscriber(src *redisx.Endpoint, epoch uint64, confirmed chan s
 		s.sub = c
 		s.mu.Unlock()
 		s.subscribed.Store(true)
+		s.downSince.Store(0)
 		if first {
 			first = false
 			close(confirmed)
@@ -506,7 +510,11 @@ func (s *Syncer) subscriber(src *redisx.Endpoint, epoch uint64, confirmed chan s
 			// notifications sent while we were disconnected are gone
 			s.resyncs.Add(1)
 			log.Printf("resubscribed to %s: full two-sided rescan", src.Name)
-			go s.FullScan()
+			go func() {
+				if _, err := s.FullScan(); err == nil {
+					s.writtenWhileDown.Store(false)
+				}
+			}()
 		}
 		for {
 			v, err := redisx.ReadValue(c.Reader())
@@ -529,6 +537,7 @@ func (s *Syncer) subscriber(src *redisx.Endpoint, epoch uint64, confirmed chan s
 			}
 		}
 		s.subscribed.Store(false)
+		s.downSince.Store(time.Now().UnixMilli())
 		c.Close()
 	}
 }
@@ -544,6 +553,8 @@ func (s *Syncer) closeSub() {
 
 // FullScan enqueues every included key of src, and the keys only dst has (to delete them).
 func (s *Syncer) FullScan() (int, error) {
+	s.scansRunning.Add(1)
+	defer s.scansRunning.Add(-1)
 	srcEP, dstEP, _ := s.dir()
 	src, err := srcEP.Dial(0)
 	if err != nil {
@@ -720,7 +731,9 @@ func (s *Syncer) Status() map[string]any {
 		"last_full_scan_ms": s.lastFullScan.Load(), "last_error": s.lastErr.Load(),
 		"compare_valid": s.compareValid(), "comparing": s.comparing.Load(), "delta_keys": s.deltaSize(),
 		"last_compare": s.lastCompare.Load(), "halted": s.haltReason(),
-		"lag_ms": s.lagMs(), "stable_ms": s.stableMs(), "copy_rate": s.copyRate.Load(),
+		"rescanning": s.scansRunning.Load() > 0, "subscription_down_ms": s.downMs(),
+		"written_while_unsubscribed": s.writtenWhileDown.Load(),
+		"lag_ms":                     s.lagMs(), "stable_ms": s.stableMs(), "copy_rate": s.copyRate.Load(),
 		"compare_rate": s.compareRate.Load(), "est_verify_ms": s.estVerifyMs(),
 	}
 }
@@ -899,6 +912,13 @@ func (s *Syncer) lagMs() int64 {
 	return lag
 }
 
+func (s *Syncer) downMs() int64 {
+	if since := s.downSince.Load(); since > 0 {
+		return time.Now().UnixMilli() - since
+	}
+	return 0
+}
+
 func (s *Syncer) stableMs() int64 {
 	if since := s.stableSince.Load(); since > 0 {
 		return time.Now().UnixMilli() - since
@@ -906,11 +926,14 @@ func (s *Syncer) stableMs() int64 {
 	return 0
 }
 
+// kept: the sync is keeping up. The oldest waiting key is checked too: the drain estimate assumes
+// at least 1,000 keys a second, so a copy that has stopped (dst refusing writes, say) with a few
+// keys left would still pass it, and the heartbeat only times the notifications.
 func (s *Syncer) kept() bool {
-	n, _ := s.Backlog()
+	n, oldest := s.Backlog()
 	drainMs := int64(n) * 1000 / max(s.copyRate.Load(), 1000)
 	return s.subscribed.Load() && !s.scanning.Load() && s.haltReason() == "" && s.lagMs() <= healthyLagMs &&
-		drainMs <= healthyLagMs
+		drainMs <= healthyLagMs && oldest <= healthyLagMs
 }
 
 // monitor sends heartbeats, keeps the rates and starts the rolling compare.
@@ -960,6 +983,19 @@ func (s *Syncer) beat(c *redisx.Conn, epoch uint64) (*redisx.Conn, uint64) {
 		}
 	}
 	now := time.Now().UnixMilli()
+	if s.downSince.Load() > 0 {
+		// No notification can come back now; what matters is whether src still takes writes.
+		// If it does, the app may be writing changes nobody sees until the rescan.
+		c.NetConn().SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.DoStr("SET", heartbeatKey, strconv.FormatInt(now, 10), "PX", "10000"); err != nil {
+			c.Close()
+			return nil, cur
+		}
+		if s.downSince.Load() > 0 {
+			s.writtenWhileDown.Store(true)
+		}
+		return c, cur
+	}
 	if sent := s.beatSent.Load(); sent > 0 && now-sent < lostBeatMs {
 		return c, cur
 	}
