@@ -22,7 +22,8 @@ Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 �
 
 | 메서드 | 경로 | 본문 | 동작 |
 |---|---|---|---|
-| POST | `/v1/prepare` | `{"target":"gcp","budget_ms":1800,"mode":"delta"}` | 사전 점검 후 동기화 시작 |
+| POST | `/v1/prepare` | `{"target":"gcp","budget_ms":1800,"mode":"delta","timeout_s":600}` | 사전 점검 후 동기화 시작. `timeout_s`는 선택이고, 그때까지 `ready`가 안 되면 이전을 취소한다 |
+| POST | `/v1/abort` | 없음 | 컷오버 전에 이전 취소. 동기화만 멈추고 앱은 원본을 계속 쓴다 |
 | POST | `/v1/execute` | `{"budget_ms":1800}` | 컷오버 |
 | POST | `/v1/rollback` | `{"mode":"normal","budget_ms":1800}` | 원본으로 복귀. 대상이 죽었으면 `"mode":"failure"` |
 | POST | `/v1/commit` | 없음 | 역방향 동기화를 끝내고 이전 확정 |
@@ -56,7 +57,7 @@ POST는 바로 `202`를 돌려주고 작업은 뒤에서 돈다. 결과는 `/v1/
 | `executed` | 전환 완료. 롤백이나 commit 가능 |
 | `rolling_back`, `rolled_back` | 롤백 중, 완료 |
 | `committing`, `committed` | 확정 중, 완료 |
-| `aborted` | 컷오버 실패로 원본에 복귀 |
+| `aborted` | 컷오버 실패로 원본에 복귀했거나 이전을 취소함. 취소 이유는 `abort_reason` |
 | `failed` | 사전 점검 실패 |
 
 | 응답 | 경우 |

@@ -123,6 +123,8 @@ class Migration:
         self._sync_retry_at = 0.0
         self._stale_since: float | None = None
         self._watch_error: str | None = None
+        self.ready_by: float | None = None      # unix time: not ready by then means give up
+        self.abort_reason: str | None = None
         self._lock = asyncio.Lock()
 
     def retire(self):
@@ -142,7 +144,8 @@ class Migration:
         if self.store:
             self.store.write(source=self.source.name, target=self.target.name, state=self._state, mode=self.mode,
                              fence_mode=self.fence_mode, switching=self.switching, last_cutover=self.last_cutover,
-                             precheck=self.precheck_report, events=self.events[-40:])
+                             precheck=self.precheck_report, events=self.events[-40:], ready_by=self.ready_by,
+                             abort_reason=self.abort_reason)
 
     def _event(self, msg: str, **extra):
         self.events.append({"t": round(time.time(), 3), "state": self.state, "msg": msg, **extra})
@@ -190,8 +193,9 @@ class Migration:
             await dst.aclose()
         return r
 
-    async def start(self, budget_ms: int = 1800) -> None:
+    async def start(self, budget_ms: int = 1800, timeout_s: int | None = None) -> None:
         async with self._lock:
+            self.ready_by = time.time() + timeout_s if timeout_s else None
             self.precheck_report = await self.precheck(budget_ms)
             self.fence_mode = self.precheck_report.get("fence", {})
             self._event("precheck", **{k: v for k, v in self.precheck_report.items() if k != "warnings"})
@@ -466,6 +470,34 @@ class Migration:
         finally:
             await cli.aclose()
 
+    # ---- abort ------------------------------------------------------------------------
+    async def abort(self, reason: str = "requested") -> None:
+        """Give up before any cutover. The app never left the source, so only the sync stops.
+        What was copied stays on the target; the next prepare compares it again."""
+        async with self._lock:
+            if self.state != "SYNCING" or self.switching:
+                raise MigrationError(f"abort only before a cutover (state={self.state})")
+            try:
+                await self.sync.call("POST", "/stop")
+            except Exception as e:  # noqa: BLE001  it comes back with no sync, or the next prepare replaces it
+                self._event("sync stop failed", error=_why(e))
+            self.ready_by, self.abort_reason = None, reason
+            self.state = "ABORTED"
+            self._event("migration aborted before cutover", reason=reason)
+
+    async def _give_up_if_late(self):
+        if self.state != "SYNCING" or not self.ready_by or time.time() < self.ready_by:
+            return
+        try:
+            why = await self.not_ready()
+        except Exception as e:  # noqa: BLE001
+            why = f"Sync Worker unreachable: {_why(e)}"
+        if why:
+            await self.abort(f"not ready in time: {why}")
+        else:       # ready: from here on it is the orchestrator's call
+            self.ready_by = None
+            self._save()
+
     # ---- rollback / commit ------------------------------------------------------------
     async def rollback(self, mode: str = "normal", budget_ms: int = 1800) -> dict:
         async with self._lock:
@@ -552,6 +584,8 @@ class Migration:
         m.last_cutover = saved.get("last_cutover")
         m.precheck_report = saved.get("precheck", {})
         m.events = saved.get("events", [])
+        m.ready_by = saved.get("ready_by")
+        m.abort_reason = saved.get("abort_reason")
         return m
 
     async def recover(self):
@@ -608,6 +642,7 @@ class Migration:
         """Outside any step (they hold the lock), the record must describe what is running."""
         if self._lock.locked():
             return
+        await self._give_up_if_late()
         try:
             px = (await self.proxy.call("GET", "/status", timeout=2))["proxy"]
         except Exception:  # noqa: BLE001  down: a restart reads the record, then this repairs the rest

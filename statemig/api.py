@@ -15,7 +15,7 @@ import os
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .backend import Endpoint
 from .migration import Admin, ControlRecord, Migration, MigrationError, MigrationStore
@@ -68,6 +68,7 @@ class StartReq(BaseModel):
     target: str
     budget_ms: int = 1800
     mode: str = "delta"    # delta | full
+    timeout_s: int | None = Field(None, gt=0)    # abort if not ready by then; None = wait
 
 
 class CutoverReq(BaseModel):
@@ -126,7 +127,7 @@ async def _new_migration(req: StartReq) -> Migration:
 @app.post("/migrations")
 async def start(req: StartReq):
     m = await _new_migration(req)
-    await _run(m.start(req.budget_ms))
+    await _run(m.start(req.budget_ms, req.timeout_s))
     return m.status()
 
 
@@ -156,7 +157,8 @@ async def commit():
 PHASES = {"PRECHECK": "preparing", "SYNCING": "preparing", "DRAINING": "executing", "CUTOVER": "executed",
           "ROLLING_BACK_DRAIN": "rolling_back", "ROLLED_BACK": "rolled_back", "COMMITTED": "committed",
           "ABORTED": "aborted", "FAILED": "failed"}
-RUNNING_PHASES = {"prepare": "preparing", "execute": "executing", "rollback": "rolling_back", "commit": "committing"}
+RUNNING_PHASES = {"prepare": "preparing", "execute": "executing", "rollback": "rolling_back", "commit": "committing",
+                  "abort": "aborting"}
 operation: dict | None = None
 operation_task: asyncio.Task | None = None
 
@@ -185,7 +187,7 @@ def _need_idle():
 async def v1_prepare(req: StartReq):
     _need_idle()
     m = await _new_migration(req)
-    return _begin("prepare", m.start(req.budget_ms))
+    return _begin("prepare", m.start(req.budget_ms, req.timeout_s))
 
 
 @app.post("/v1/execute", status_code=202)
@@ -206,6 +208,12 @@ async def v1_commit():
     return _begin("commit", _need_current().commit())
 
 
+@app.post("/v1/abort", status_code=202)
+async def v1_abort():
+    _need_idle()
+    return _begin("abort", _need_current().abort())
+
+
 @app.get("/v1/status")
 async def v1_status():
     running = operation and operation["state"] == "running"
@@ -220,4 +228,5 @@ async def v1_status():
     return {"resource": "redis", "phase": phase, "ready": ready, "source": m.source.name if m else None,
             "target": m.target.name if m else None, "active": (record.read() or {}).get("active"),
             "operation": operation, "last_cutover": m.last_cutover if m else None,
-            "sync": await m.sync_view() if m else None, "events": m.events[-20:] if m else []}
+            "sync": await m.sync_view() if m else None, "abort_reason": m.abort_reason if m else None,
+            "events": m.events[-20:] if m else []}

@@ -362,6 +362,63 @@ def budget_exceeded_in_pause():
            f"{st['operation']['error']}, 쓰기 {acks}건, 유실 {len(lost)}건")
 
 
+# ---- giving up before a cutover -------------------------------------------------------------
+def abort_before_cutover():
+    w = fresh()
+    to_ready()
+    r = API.post("/v1/abort")
+    st = wait_phase("aborted")
+    running = SYNC.get("/status").json()["running"]
+    acks = flowing(w)
+    px = proxy_status()
+    refused = API.post("/v1/execute")
+    time.sleep(0.5)
+    op = status()["operation"]
+    report("컷오버 전 취소 → 동기화 중지, 앱은 원본 유지, 컷오버 거부",
+           r.status_code == 202 and st.get("phase") == "aborted" and not running and px["active"] == "aws"
+           and not px["paused"] and acks > 0 and op["name"] == "execute" and op["state"] == "failed",
+           f"phase={st.get('phase')}, 쓰기 {acks}건, {refused.status_code} {op['error']}")
+    API.post("/v1/prepare", json={"target": "gcp"})
+    again = wait_phase("ready")
+    API.post("/v1/execute")
+    done = wait_phase("executed")
+    w.stop()
+    report("취소 뒤 prepare → ready → 컷오버 가능", again.get("phase") == "ready" and done.get("phase") == "executed",
+           done.get("phase"))
+    API.post("/v1/abort")
+    time.sleep(0.5)
+    st = status()
+    report("컷오버 뒤에는 취소 거부", st["operation"]["state"] == "failed" and st["phase"] == "executed"
+           and proxy_status()["active"] == "gcp", st["operation"]["error"])
+
+
+def prepare_times_out():
+    w = fresh()
+    API.post("/v1/prepare", json={"target": "gcp", "timeout_s": 1})     # ready needs 3s of keeping up
+    st = wait_phase("aborted", timeout=15)
+    acks = flowing(w)
+    w.stop()
+    report("제한 시간 안에 ready가 안 됨 → 이전 취소, 이유 표시",
+           st.get("phase") == "aborted" and "not ready in time" in str(st.get("abort_reason"))
+           and proxy_status()["active"] == "aws" and acks > 0, st.get("abort_reason"))
+
+
+def statemig_dies_in_abort():
+    w = fresh()
+    to_ready()
+    API.post("/__hook/arm", json={"points": {"before:sync:/stop#1": "crash"}})
+    API.post("/v1/abort")
+    until(lambda: not api_up(), 15, "statemig died")
+    start("statemig")
+    until(api_up, 30, "statemig back")
+    back = wait_phase("ready", timeout=20)
+    API.post("/v1/abort")
+    st = wait_phase("aborted")
+    w.stop()
+    report("취소 중 제어부 사망 → 이전은 그대로, 다시 취소 가능",
+           back.get("phase") == "ready" and st.get("phase") == "aborted", f"{back.get('phase')} → {st.get('phase')}")
+
+
 # ---- statemig dies inside a failure rollback ---------------------------------------------------
 def failure_steps() -> list[str]:
     w = fresh()
@@ -419,6 +476,9 @@ def main():
     safe(sync_worker_hung)
     safe(budget_refused_without_pause)
     safe(budget_exceeded_in_pause)
+    safe(abort_before_cutover)
+    safe(prepare_times_out)
+    safe(statemig_dies_in_abort)
     for point in failure_steps():
         safe(statemig_dies_in_failure_rollback, point)
     compose("down", "-v", "-t", "0", "--remove-orphans")
