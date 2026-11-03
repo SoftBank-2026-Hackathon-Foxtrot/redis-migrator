@@ -90,11 +90,10 @@ func (st *subState) track(name string, args [][]byte) {
 
 // dialUp opens an upstream on the session's db and protocol (HELLO is replayed).
 func (s *session) dialUp(ep *redisx.Endpoint, timeout time.Duration) (*redisx.Conn, error) {
-	c, err := ep.Dial(s.db)
+	c, err := ep.DialWithin(s.db, timeout) // the deadline also covers HELLO and the subscribes after it
 	if err != nil {
 		return nil, err
 	}
-	c.NetConn().SetDeadline(time.Now().Add(timeout))
 	if s.hello != nil {
 		redisx.WriteCommand(c.Writer(), s.hello...)
 		if err = c.Writer().Flush(); err == nil {
@@ -312,8 +311,10 @@ func token() string {
 }
 
 // move hands the subscription over to ep: barrier on the old upstream, then the new one reads.
-// It returns whether every message of the old upstream was relayed first.
+// It returns whether every message of the old upstream was relayed first. The dial and the barrier
+// share timeout: every client's writes are held meanwhile.
 func (s *session) move(st *subState, ep *redisx.Endpoint, timeout time.Duration) (bool, error) {
+	deadline := time.Now().Add(timeout)
 	if err := s.prepare(st, ep, timeout); err != nil {
 		return false, err
 	}
@@ -329,14 +330,14 @@ func (s *session) move(st *subState, ep *redisx.Endpoint, timeout time.Duration)
 		[]byte("$" + strconv.Itoa(len(tok)) + "\r\n" + tok + "\r\n"),                     // RESP3
 	})
 	complete := false
-	old.conn.NetConn().SetWriteDeadline(time.Now().Add(timeout))
+	old.conn.NetConn().SetWriteDeadline(deadline)
 	redisx.WriteCommand(old.conn.Writer(), []byte("PING"), []byte(tok))
 	if old.conn.Writer().Flush() == nil {
 		select {
 		case <-old.reached:
 			complete = true
 		case <-old.done: // the old backend is gone (a failure rollback): nothing more can come from it
-		case <-time.After(timeout):
+		case <-time.After(time.Until(deadline)):
 		}
 	}
 	old.retired.Store(true)
@@ -417,9 +418,9 @@ func (p *Proxy) dropPrepared(keep string) {
 
 // moveSubs moves every subscription to the active backend. A session that cannot be moved is
 // closed, as before, so its client resubscribes; a normal cutover has prepared them all already.
-func (p *Proxy) moveSubs(ep *redisx.Endpoint) {
+func (p *Proxy) moveSubs(ep *redisx.Endpoint, wait time.Duration) {
 	p.eachSub(func(s *session, st *subState) error {
-		complete, err := s.move(st, ep, time.Second)
+		complete, err := s.move(st, ep, wait)
 		switch {
 		case err != nil:
 			p.Stats.PubsubDropped.Add(1)

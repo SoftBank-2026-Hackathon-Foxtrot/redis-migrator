@@ -223,9 +223,12 @@ func (s *server) switchRoute(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	if req.MaxWaitMs <= 0 || req.MaxWaitMs > 1000 {
+		req.MaxWaitMs = 1000
+	}
 	route, err := s.recordFor(req.Gen)
 	if err == nil {
-		err = s.proxy.Switch(route)
+		err = s.proxy.Switch(route, time.Duration(req.MaxWaitMs)*time.Millisecond)
 	}
 	if err != nil {
 		fail(w, err)

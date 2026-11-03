@@ -225,7 +225,8 @@ func (p *Proxy) Pause(maxWait time.Duration) (float64, error) {
 }
 
 // Switch changes the route. Only allowed while paused and only to a newer generation.
-func (p *Proxy) Switch(r Route) error {
+// moveWait limits how long a subscription may take to move.
+func (p *Proxy) Switch(r Route, moveWait time.Duration) error {
 	p.mu.Lock()
 	if !p.paused {
 		p.mu.Unlock()
@@ -248,7 +249,7 @@ func (p *Proxy) Switch(r Route) error {
 	for _, s := range subs {
 		s.nc.Close()
 	}
-	p.moveSubs(r.Active) // still paused: no PUBLISH reaches the new backend before this is done
+	p.moveSubs(r.Active, moveWait) // still paused: no PUBLISH reaches the new backend before this is done
 	p.Stats.Switches.Add(1)
 	log.Printf("switch gen %d→%d active %s→%s consume %s→%s", old.Gen, r.Gen, old.Active.Name, r.Active.Name,
 		old.Consume.Name, r.Consume.Name)

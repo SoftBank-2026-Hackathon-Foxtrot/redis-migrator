@@ -166,7 +166,7 @@ func TestStuckSubscriberDoesNotHoldSwitch(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	t0 := time.Now()
-	go func() { done <- p.Switch(Route{Gen: 2, Active: gcp.ep, Consume: gcp.ep}) }()
+	go func() { done <- p.Switch(Route{Gen: 2, Active: gcp.ep, Consume: gcp.ep}, time.Second) }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -183,6 +183,56 @@ func TestStuckSubscriberDoesNotHoldSwitch(t *testing.T) {
 	}
 }
 
+// A switch keeps to its limit with a stuck client on the old side.
+func TestSwitchKeepsToItsLimitWithStuckSubscriber(t *testing.T) {
+	aws, gcp := newFakeRedis(t, "aws", true), newFakeRedis(t, "gcp", false)
+	p, addr := startProxy(t, aws)
+	subscribe(t, addr, p)
+	time.Sleep(500 * time.Millisecond)
+
+	if _, err := p.Pause(time.Second); err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Now()
+	if err := p.Switch(Route{Gen: 2, Active: gcp.ep, Consume: gcp.ep}, 200*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(t0); d > 500*time.Millisecond {
+		t.Errorf("switch took %v with a 200ms limit", d)
+	}
+}
+
+// A target that accepts connections and never answers AUTH costs a switch its limit, not a hang.
+func TestSwitchKeepsToItsLimitWithSilentTarget(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	eps, _, err := redisx.ParseEndpoints("silent=redis://:pw@" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	silent := eps["silent"]
+
+	aws := newFakeRedis(t, "aws", false)
+	p, addr := startProxy(t, aws)
+	subscribe(t, addr, p)
+	if _, err := p.Pause(time.Second); err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Now()
+	if err := p.Switch(Route{Gen: 2, Active: silent, Consume: silent}, 200*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(t0); d > 500*time.Millisecond {
+		t.Errorf("switch took %v with a 200ms limit", d)
+	}
+	if n := p.Stats.PubsubDropped.Load(); n != 1 {
+		t.Errorf("pubsub_dropped = %d, want 1", n)
+	}
+}
+
 // A healthy subscriber keeps its connection and hears from the new backend after a switch.
 func TestSwitchMovesSubscriber(t *testing.T) {
 	aws, gcp := newFakeRedis(t, "aws", false), newFakeRedis(t, "gcp", false)
@@ -192,7 +242,7 @@ func TestSwitchMovesSubscriber(t *testing.T) {
 	if _, err := p.Pause(time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Switch(Route{Gen: 2, Active: gcp.ep, Consume: gcp.ep}); err != nil {
+	if err := p.Switch(Route{Gen: 2, Active: gcp.ep, Consume: gcp.ep}, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	p.Resume()

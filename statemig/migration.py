@@ -393,7 +393,8 @@ class Migration:
         """Steps 4–7. Safe to run again: a restart converges by calling this once more."""
         while True:
             try:
-                await self.proxy.call("POST", "/switch", {"gen": gen})
+                # 100ms less: the proxy may wait that long more to close a client that does not read
+                await self.proxy.call("POST", "/switch", {"gen": gen, "max_wait_ms": max(100, left() - 100)})
                 break
             except Exception as e:  # noqa: BLE001
                 try:
@@ -793,8 +794,11 @@ class Migration:
         try:
             # PUBLISH is not in @write: it is taken away too, or a client off the proxy could still
             # publish to a side nobody subscribes to any more.
-            rules = ["on", "~*", "&*", "+@all"] if allowed else ["on", "~*", "&*", "+@all", "-@write",
-                                                                 "-publish", "-spublish", *CONSUME_CMDS.split()]
+            rules = ["on", "~*", "&*", "+@all"]
+            if not allowed:
+                rules += ["-@write", "-publish", *CONSUME_CMDS.split()]
+                if await _has_spublish(c):
+                    rules.append("-spublish")
             await c.execute_command("ACL", "SETUSER", self.app_user, *rules)
             try:
                 await c.execute_command("ACL", "SAVE")
@@ -803,6 +807,12 @@ class Migration:
                     raise
         finally:
             await c.aclose()
+
+
+async def _has_spublish(c) -> bool:
+    """SPUBLISH came with Redis 7, and ACL SETUSER refuses all its rules over a command it does not know.
+    Valkey reports the Redis version it is compatible with here."""
+    return int((await c.info("server"))["redis_version"].split(".")[0]) >= 7
 
 
 def _why(e: Exception) -> str:

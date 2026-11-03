@@ -59,7 +59,17 @@ type Conn struct {
 }
 
 func (e *Endpoint) Dial(db int) (*Conn, error) {
-	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	return e.dial(db, 5*time.Second, time.Time{})
+}
+
+// DialWithin bounds the whole dial, AUTH and SELECT included. The deadline stays on the connection:
+// the caller moves or clears it.
+func (e *Endpoint) DialWithin(db int, timeout time.Duration) (*Conn, error) {
+	return e.dial(db, timeout, time.Now().Add(timeout))
+}
+
+func (e *Endpoint) dial(db int, connectTimeout time.Duration, deadline time.Time) (*Conn, error) {
+	d := net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 	var nc net.Conn
 	var err error
 	if e.TLS {
@@ -70,6 +80,7 @@ func (e *Endpoint) Dial(db int) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	nc.SetDeadline(deadline)
 	c := &Conn{nc: nc, r: bufio.NewReaderSize(nc, 64<<10), w: bufio.NewWriterSize(nc, 64<<10)}
 	if e.password != "" {
 		args := []string{"AUTH"}
