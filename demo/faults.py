@@ -168,6 +168,19 @@ async def case_budget_too_small(ctl: Ctl):
            and m["state"] == "FAILED", m["precheck"].get("estimate"))
 
 
+async def case_other_db(ctl: Ctl):
+    c = aioredis.from_url(ADMIN["aws"] + "/3", decode_responses=True)
+    await c.set("session:in-db3", "1")
+    try:
+        r = await ctl.post("/migrations", {"target": "gcp"})
+        m = await ctl.migration()
+    finally:
+        await c.delete("session:in-db3")
+        await c.aclose()
+    report("사전 확인: 원본 db 0 밖에 키 → 시작 안 함", r.status_code == 409 and "outside db 0 (db3)" in r.text
+           and m["state"] == "FAILED", r.json().get("detail"))
+
+
 async def case_cache_count(ctl: Ctl):
     await ctl.sync_ready()
     c = admin("gcp")
@@ -445,6 +458,9 @@ async def case_permissions():
         ("worker XTRIM", wk_u, ("XTRIM", "q:join", "MAXLEN", "0"), "may not run"),
         ("worker GROUP 삭제", wk_u, ("XGROUP", "DESTROY", "q:join", "workers"), "may not run"),
         ("worker 세션 읽기", wk_u, ("GET", "session:x"), "only touch"),
+        ("앱 SELECT 1", app_u, ("SELECT", "1"), "only db 0"),
+        ("worker SELECT 2", wk_u, ("SELECT", "2"), "only db 0"),
+        ("앱 COPY DB 1", app_u, ("COPY", "session:a", "session:b", "DB", "1"), "only db 0"),
     ]
     bad = []
     for name, url, cmd, want in cases:
@@ -454,6 +470,8 @@ async def case_permissions():
     report(f"프록시 역할별 명령 제한 ({len(cases)}건)", not bad, bad or "")
     allowed = await expect_denied(app_u, "SET", "session:perm-probe", "1")
     report("앱 정상 명령은 허용", allowed == "allowed", allowed)
+    select0 = await expect_denied(app_u, "SELECT", "0")
+    report("SELECT 0은 허용", select0 == "allowed", select0)
     codes = {}
     async with httpx.AsyncClient(timeout=10) as h:
         for name, url in (("proxy", PROXY_ADMIN), ("sync", SYNC_ADMIN), ("control", CTL)):
@@ -486,6 +504,7 @@ async def main():
         await case_poison_message(ctl)
         await case_delayed_rebuilt(ctl)
         await case_budget_too_small(ctl)
+        await case_other_db(ctl)
         await case_reverse_subscribe_fails(ctl, load)
         await case_fence_fails(ctl, load)
         await case_group_missing(ctl, load)

@@ -142,6 +142,22 @@ var (
 	pubsubCmds = set("subscribe", "psubscribe", "ssubscribe", "monitor")
 )
 
+// otherDB reports a command that would reach a db other than 0: only db 0 is synced, so a
+// write there would be left behind by a migration without any error.
+func otherDB(name string, args [][]byte) bool {
+	switch name {
+	case "select":
+		return len(args) != 2 || string(args[1]) != "0"
+	case "copy": // COPY src dst [DB n] [REPLACE]
+		for i := 3; i < len(args); i++ {
+			if strings.EqualFold(string(args[i]), "db") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func set(xs ...string) map[string]bool {
 	m := map[string]bool{}
 	for _, x := range xs {

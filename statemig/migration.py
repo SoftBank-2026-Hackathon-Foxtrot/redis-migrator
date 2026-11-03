@@ -171,6 +171,10 @@ class Migration:
                 return r
             si, ti = await src.info(), await dst.info()
             r["source_version"], r["target_version"] = _version(si), _version(ti)
+            for name, info in (("source", si), ("target", ti)):
+                r["errors"] += [f"{e} on {name}" for e in _topology_errors(info)]
+            if r["errors"]:
+                return r
             if ti.get("maxmemory") and ti["maxmemory"] < si.get("used_memory", 0):
                 r["errors"].append("target maxmemory < source used_memory")
             for ep, name, c in ((self.source, "source", src), (self.target, "target", dst)):
@@ -759,6 +763,18 @@ class Migration:
 def _why(e: Exception) -> str:
     """httpx timeouts have an empty message."""
     return str(e) or type(e).__name__
+
+
+def _topology_errors(info: dict) -> list[str]:
+    """What this migrator cannot move whole: a cluster (one node holds only some slots) and keys
+    outside db 0 (notifications, scans and copies all work on db 0 only)."""
+    errors = []
+    if info.get("cluster_enabled"):
+        errors.append("cluster mode is not supported")
+    other = sorted((k for k in info if k.startswith("db") and k[2:].isdigit() and k != "db0"), key=lambda k: int(k[2:]))
+    if other:
+        errors.append(f"keys outside db 0 ({', '.join(other)}): only db 0 is migrated")
+    return errors
 
 
 def _version(info: dict) -> str:

@@ -419,6 +419,10 @@ func (s *session) run() {
 			p.Stats.Denied.Add(1)
 			s.reply(redisx.ErrorReply("ERR " + name + " is not allowed through the proxy"))
 			continue
+		case otherDB(name, args):
+			p.Stats.Denied.Add(1)
+			s.reply(redisx.ErrorReply("ERR only db 0 is supported through the proxy"))
+			continue
 		case name == "hello":
 			// Backend auth is the proxy's job: check AUTH against the proxy password,
 			// strip it, and remember the rest so it's replayed on every new upstream.
