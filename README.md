@@ -129,6 +129,7 @@ cd demo && docker compose up -d --build
 | `python demo/topology_check.py` | 사전 점검의 거부 조건 (자체 컨테이너) |
 | `python demo/loss_report_check.py` | 장애 롤백의 유실 범위 보고 |
 | `python demo/pubsub_check.py` | 전환 중 구독 유지, 메시지 유실·중복 |
+| `sudo python demo/syn_loss_check.py` | SYN이 유실돼도 장애 롤백의 쓰기 정지가 1초 미만 (root, iptables) |
 | `cd proxy && go test ./...` | 멈춘 구독자, 구독 연결의 명령 제한 |
 | `python demo/aws_check.py` | 실제 ElastiCache. 같은 VPC의 호스트에서 실행 |
 
@@ -140,12 +141,11 @@ ElastiCache for Valkey 8.0, Memorystore for Redis 7.2, 온프레 Valkey 8.0을 T
 
 - 컷오버, 정상 롤백, 연속 이전: 쓰기 정지 210~676ms. 채팅(Pub/Sub) 유실·중복, WebSocket 끊김, 로그인 실패 모두 0건
 - Valkey 8.0과 Redis 7.2 사이의 `DUMP`/`RESTORE`는 양방향으로 동작했다
-- 장애 롤백: 쓰기 정지 0.5~4.1초. 간헐적인 약 3.6초 지연은 원인을 찾지 못했고, 이때는 예산 1800ms를 넘는다
+- 장애 롤백: 쓰기 정지 0.5~4.1초. 4.1초는 쓰기 정지 안에서 새 연결을 열다 SYN이 유실돼 커널 재시도(1초, 3초)를 기다린 것이다. 로컬에서 같은 4.1초를 재현했고, 연결을 정지 전에 열어 두고 새 연결은 0.3초 만에 재시도하도록 고쳐 57~329ms가 됐다. 실환경 재측정은 하지 않았다
 - 구간별 1~2회, 키 7600개, 구독 3개 이하 규모다. DB·오브젝트·트래픽 계층과의 통합과 오케스트레이터는 포함하지 않았다
 
 ## 아직 안 된 것
 
-- 장애 롤백의 간헐적 3.6초 지연 원인
 - 오케스트레이터 연결
 - 공통 스펙 확정 후 API 조정
 
