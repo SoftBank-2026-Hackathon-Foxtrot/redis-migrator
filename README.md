@@ -102,9 +102,73 @@ ACTIVE → QUIESCED → ROLLED_BACK_HELD → RESTORED → COMPLETED
 
 ## 배포 위치
 
-프록시, Sync Worker, statemig는 AWS 관리 VPC에 둔다. 프록시와 statemig는 `control.json`을 공유하므로 같은 호스트에 둔다.
+프록시, Sync Worker, statemig는 AWS 관리 VPC에 둔다. 프록시와 statemig는 `control.json`을 공유하므로 같은 파일 시스템을 마운트한다(ECS에서는 EFS, 아래 참고).
 
 환경 간 연결은 Tailscale로 한다. ElastiCache와 Memorystore에는 Tailscale을 설치할 수 없어서 각 VPC의 라우터나 피어링을 거친다.
+
+## ECS 배포
+
+앱 태스크는 몇 개든 된다. 모두 같은 프록시 주소에 붙으면 된다. 프록시를 앱마다 사이드카로 붙이면 프록시가 여러 대가 되어 지원하지 않는다.
+
+### 이미지
+
+| 이미지 | 빌드 | 실행 |
+| --- | --- | --- |
+| Go (프록시, Sync Worker) | `docker build -t statemig-go proxy/` | 프록시: 기본 entrypoint `statemig-proxy`. Sync Worker: entrypoint를 `statemig-syncworker`로 |
+| statemig | `docker build -t statemig .` | command `uvicorn statemig.api:app --host 0.0.0.0 --port 8090 --timeout-keep-alive 120` |
+
+### 서비스
+
+세 서비스 모두 태스크 1개로 고정한다. 둘이 동시에 뜨면 같은 마이그레이션을 두 곳에서 진행하므로, 배포 설정은 `minimumHealthyPercent=0`, `maximumPercent=100`으로 둔다(옛 태스크를 내린 뒤 새 태스크를 띄움). 오토스케일링은 붙이지 않는다. 마이그레이션 중에는 이 세 서비스를 배포하지 않는다.
+
+| 서비스 | 포트 | 여는 대상 | `/state` |
+| --- | --- | --- | --- |
+| proxy | 6379 (앱 연결), 7000 (관리) | 6379: 앱 태스크. 7000: statemig | EFS |
+| syncworker | 7100 (관리) | statemig | 없음 |
+| statemig | 8090 (API) | 컨트롤 플레인 | EFS |
+
+앱은 프록시를 고정 이름으로 찾는다(Cloud Map 또는 내부 DNS, 예: `redis-proxy.internal:6379`). statemig는 프록시와 Sync Worker를 같은 방식으로 찾는다.
+
+### EFS
+
+statemig와 proxy가 같은 EFS 접근 지점을 `/state`로 마운트한다. 들어가는 파일은 전환 기록 `control.json`과 진행 상태 `migration.json`, `common.json`이다(수 KB).
+
+statemig가 태스크 교체로 이 파일을 잃으면 컷오버를 한 적이 없다고 보고 프록시를 원본으로 되돌린다. 그래서 태스크 로컬 디스크에 두면 안 된다. 파일은 임시 파일에 쓰고 rename으로 교체한다. 보안 그룹에서 두 서비스 → EFS의 NFS(2049)를 연다.
+
+### 환경 변수
+
+`[비밀]`은 Secrets Manager에서 넣는다. 엔드포인트 이름(`aws`, `gcp`, `onprem` 등)은 세 서비스에서 같아야 한다. TLS가 켜진 Redis는 `rediss://`로 쓴다.
+
+| 변수 | proxy | syncworker | statemig |
+| --- | --- | --- | --- |
+| `STATEMIG_ENDPOINTS` [비밀] | `aws=redis://app:<앱 계정 pw>@<원본>:6379,gcp=redis://app:<pw>@<대상>:6379`. 앱 계정 | `aws=redis://default:<관리자 pw>@...,gcp=...`. 관리자 계정 | syncworker와 같음 |
+| `STATEMIG_ADMIN_TOKEN` [비밀] | 같은 값 | 같은 값 | 같은 값 |
+| `STATEMIG_CONTROL_FILE` | `/state/control.json` | | `/state/control.json` |
+| `STATEMIG_ACTIVE` | 처음 쓸 Redis 이름 (예: `aws`). 기록이 없을 때만 씀 | | |
+| `STATEMIG_CLIENTS` [비밀] | 앱이 프록시에 AUTH할 계정. `app:<pw>:app,worker:<pw>:worker` | | |
+| `STATEMIG_PROXY` | | | `http://redis-proxy.internal:7000` |
+| `STATEMIG_SYNCWORKER` | | | `http://redis-syncworker.internal:7100` |
+| `STATEMIG_APP_USER` | | | 앱 계정 이름 (기본 `app`). 원본 쓰기 차단에 씀 |
+
+앱은 프록시 주소와 `STATEMIG_CLIENTS`의 계정으로 붙는다. Redis 비밀번호는 프록시만 안다.
+
+### 헬스체크
+
+모든 API가 관리 토큰을 요구하므로 컨테이너 안에서 토큰을 붙여 `GET /status`를 부른다.
+
+```bash
+# proxy (7000), syncworker (7100): alpine 이미지의 wget
+wget -q -O /dev/null --header "Authorization: Bearer $STATEMIG_ADMIN_TOKEN" http://127.0.0.1:7000/status
+```
+
+```bash
+# statemig: python 이미지
+python -c "import os,urllib.request as u;u.urlopen(u.Request('http://127.0.0.1:8090/status',headers={'Authorization':'Bearer '+os.environ['STATEMIG_ADMIN_TOKEN']}),timeout=3)"
+```
+
+### 망
+
+프록시와 Sync Worker는 원본과 대상 Redis에 직접 닿아야 한다. AWS ECS에서 GCP Memorystore로 가는 경로(Tailscale 서브넷 라우터, VPN)는 인프라에서 연다. 왕복 시간이 쓰기 정지 시간을 정한다(30ms 기준 약 150ms).
 
 ## 실행
 
