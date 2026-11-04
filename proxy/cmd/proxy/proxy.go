@@ -166,23 +166,38 @@ func (p *Proxy) Route() (Route, bool) {
 // lock, so a fill can't slip past the check and end up held instead of dropped. The third
 // last result lists the cache keys this command holds as pending; pass it back to exit.
 func (p *Proxy) enter(name string, args [][]byte, db int, inTx, resp3 bool) (Route, uint64, bool, []byte, []string) {
-	held := !inTx && !consumeCmds[name] && p.cmds.Held(name)
-	if inTx || (!p.pausedA.Load() && p.pendingN.Load() == 0) { // the common case: no lock
-		if held {
-			p.inflightA.Add(1)
-			if p.pausedA.Load() || p.pendingN.Load() > 0 { // a PAUSE came in between: the slow path decides
-				p.inflightA.Add(-1)
-				return p.enterSlow(name, args, db, held, resp3)
-			}
-		}
+	if inTx {
 		if g := p.gate.Load(); g != nil {
-			return g.route, g.epoch, held, nil, nil
+			return g.route, g.epoch, false, nil, nil
 		}
-		if held { // built without NewProxy (tests): the locked path has everything
+	} else if r, e, held, ok := p.tryEnter(name); ok {
+		return r, e, held, nil, nil
+	}
+	return p.enterSlow(name, args, db, !inTx && !consumeCmds[name] && p.cmds.Held(name), resp3)
+}
+
+// tryEnter is the gate without the lock, for the common case: no PAUSE, no cache key pending.
+// It never waits; ok=false sends the caller to the locked path.
+func (p *Proxy) tryEnter(name string) (r Route, epoch uint64, held, ok bool) {
+	if p.pausedA.Load() || p.pendingN.Load() > 0 {
+		return
+	}
+	held = !consumeCmds[name] && p.cmds.Held(name)
+	if held {
+		p.inflightA.Add(1)
+		if p.pausedA.Load() || p.pendingN.Load() > 0 { // a PAUSE came in between: the slow path decides
 			p.inflightA.Add(-1)
+			return Route{}, 0, false, false
 		}
 	}
-	return p.enterSlow(name, args, db, held, resp3)
+	g := p.gate.Load()
+	if g == nil { // built without NewProxy (tests): the locked path has everything
+		if held {
+			p.inflightA.Add(-1)
+		}
+		return Route{}, 0, false, false
+	}
+	return g.route, g.epoch, held, true
 }
 
 func (p *Proxy) enterSlow(name string, args [][]byte, db int, held, resp3 bool) (Route, uint64, bool, []byte, []string) {
@@ -378,6 +393,37 @@ type session struct {
 	pubsub   atomic.Bool
 	sub      atomic.Pointer[subState] // a subscription the proxy can move to another backend
 	wmu      sync.Mutex               // client writes, once a subscription reader writes too
+
+	// A client's pipeline goes upstream as one write too: the commands queued here are written
+	// but not flushed, their replies read when the batch is flushed.
+	batch     []queued
+	batchEP   *redisx.Endpoint
+	batchUp   *redisx.Conn
+	batchEpoc uint64
+}
+
+type queued struct {
+	name string
+	args [][]byte
+	held bool
+	t0   time.Time
+}
+
+const maxBatch = 256
+
+// unbatched are the commands that change session state, wait, or are answered out of band:
+// each one goes alone, after the batch before it has been answered.
+var unbatched = set("auth", "hello", "quit", "select", "multi", "exec", "discard", "watch", "unwatch",
+	"client", "reset", "monitor", "sync", "psync", "subscribe", "psubscribe", "ssubscribe", "unsubscribe",
+	"punsubscribe", "sunsubscribe", "wait", "waitaof", "blpop", "brpop", "brpoplpush", "blmove", "blmpop",
+	"bzpopmin", "bzpopmax", "bzmpop")
+
+func batchable(name string, args [][]byte) bool {
+	if unbatched[name] || consumeCmds[name] || deniedCmds[name] {
+		return false
+	}
+	_, blocking := blockMs(args)
+	return !blocking
 }
 
 // login checks an account and remembers its role.
@@ -437,14 +483,17 @@ func (s *session) run() {
 	defer s.close()
 	p := s.p
 	buf := make([]byte, 0, 4096)
+	defer s.flushBatch()
 	for {
 		if s.cr.Buffered() == 0 { // flush once per pipeline batch
+			s.flushBatch()
 			if err := s.cw.Flush(); err != nil {
 				return
 			}
 		}
 		args, err := redisx.ReadCommand(s.cr)
 		if err != nil {
+			s.flushBatch()
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				s.cw.Write(redisx.ErrorReply("ERR " + err.Error()))
 				s.cw.Flush()
@@ -452,6 +501,10 @@ func (s *session) run() {
 			return
 		}
 		name := string(bytes.ToLower(args[0]))
+		canBatch := s.authed && !s.inTx() && batchable(name, args)
+		if !canBatch {
+			s.flushBatch()
+		}
 
 		// answered by the proxy itself
 		switch {
@@ -491,6 +544,7 @@ func (s *session) run() {
 			}
 		}
 		if why := s.role.deny(name, args, p.keys); why != "" {
+			s.flushBatch()
 			p.Stats.Denied.Add(1)
 			s.reply(redisx.ErrorReply("NOPERM " + why))
 			continue
@@ -498,7 +552,27 @@ func (s *session) run() {
 
 		t0 := time.Now() // includes time at the gate: the pause shows up in latency honestly
 		wasTx := s.inTx()
-		route, epoch, held, answered, pending := p.enter(name, args, s.db, wasTx, s.resp3())
+		var route Route
+		var epoch uint64
+		var held, fast bool
+		var answered []byte
+		var pending []string
+		if canBatch {
+			// Only past the open gate: a command that would wait there must not keep the
+			// queued writes in flight, PAUSE waits for those.
+			if route, epoch, held, fast = p.tryEnter(name); fast {
+				if len(s.batch) > 0 && (s.batchEP != route.Active || s.batchEpoc != epoch || len(s.batch) >= maxBatch) {
+					s.flushBatch()
+				}
+				if s.queue(route.Active, route, epoch, name, args, held, t0) {
+					continue
+				}
+			}
+		}
+		if !fast {
+			s.flushBatch()
+			route, epoch, held, answered, pending = p.enter(name, args, s.db, wasTx, s.resp3())
+		}
 		if answered != nil {
 			p.Stats.CacheBypassed.Add(1)
 			s.reply(answered)
@@ -553,9 +627,65 @@ func (s *session) run() {
 	}
 }
 
-// forward sends one command to ep. After a route change, upstreams to backends
-// that are no longer in the route are closed (the old writer connection goes away).
-func (s *session) forward(ep *redisx.Endpoint, route Route, epoch uint64, args [][]byte, dst []byte) ([]byte, error) {
+// queue writes a command to ep's upstream without flushing; false if there is no upstream to
+// write to (the command then goes the ordinary way, which dials and reports the error).
+func (s *session) queue(ep *redisx.Endpoint, route Route, epoch uint64, name string, args [][]byte, held bool, t0 time.Time) bool {
+	if len(s.batch) == 0 {
+		up, err := s.upstream(ep, route, epoch, args)
+		if err != nil {
+			return false
+		}
+		s.batchEP, s.batchUp, s.batchEpoc = ep, up, epoch
+	}
+	redisx.WriteCommand(s.batchUp.Writer(), args...)
+	s.batch = append(s.batch, queued{name, args, held, t0})
+	return true
+}
+
+// flushBatch sends the queued commands and answers each in order.
+func (s *session) flushBatch() {
+	if len(s.batch) == 0 {
+		return
+	}
+	p, up := s.p, s.batchUp
+	if p.upstreamTimeout > 0 {
+		up.NetConn().SetDeadline(time.Now().Add(p.upstreamTimeout))
+	} else {
+		up.NetConn().SetDeadline(time.Time{})
+	}
+	err := up.Writer().Flush()
+	buf := make([]byte, 0, 512)
+	for _, q := range s.batch {
+		if err == nil {
+			buf, err = redisx.ReadRawReply(up.Reader(), buf[:0])
+		}
+		if err != nil {
+			p.Stats.UpstreamErrors.Add(1)
+			buf = append(buf[:0], redisx.ErrorReply("ERR upstream unavailable: "+err.Error())...)
+			if _, paused := p.Route(); paused && q.name == "get" && len(q.args) > 1 && isCacheKey(q.args[1]) {
+				buf = append(buf[:0], cacheMiss(s.resp3())...)
+			}
+		}
+		p.exit(q.held, 0, nil)
+		p.Stats.Commands.Add(1)
+		p.latency.add(time.Since(q.t0))
+		if len(buf) > 0 && buf[0] == '-' {
+			p.Stats.ErrorReplies.Add(1)
+		}
+		s.reply(buf)
+	}
+	if err != nil {
+		up.Close()
+		if s.ups[s.batchEP.Name] == up {
+			delete(s.ups, s.batchEP.Name)
+		}
+	}
+	s.batch, s.batchEP, s.batchUp = s.batch[:0], nil, nil
+}
+
+// upstream returns the session's connection to ep, dialled if needed. After a route change,
+// upstreams to backends that are no longer in the route are closed.
+func (s *session) upstream(ep *redisx.Endpoint, route Route, epoch uint64, args [][]byte) (*redisx.Conn, error) {
 	if s.upEpoch != epoch {
 		for name, c := range s.ups {
 			if name != route.Active.Name && name != route.Consume.Name && (s.txEP == nil || name != s.txEP.Name) {
@@ -565,24 +695,33 @@ func (s *session) forward(ep *redisx.Endpoint, route Route, epoch uint64, args [
 		}
 		s.upEpoch = epoch
 	}
-	up := s.ups[ep.Name]
-	if up == nil {
-		c, err := ep.Dial(s.db)
+	if up := s.ups[ep.Name]; up != nil {
+		return up, nil
+	}
+	c, err := ep.Dial(s.db)
+	if err != nil {
+		return nil, err
+	}
+	if s.hello != nil && !strings.EqualFold(string(args[0]), "hello") {
+		redisx.WriteCommand(c.Writer(), s.hello...)
+		if err := c.Writer().Flush(); err == nil {
+			_, err = redisx.ReadRawReply(c.Reader(), nil)
+		}
 		if err != nil {
-			return dst, err
+			c.Close()
+			return nil, err
 		}
-		if s.hello != nil && !strings.EqualFold(string(args[0]), "hello") {
-			redisx.WriteCommand(c.Writer(), s.hello...)
-			if err := c.Writer().Flush(); err == nil {
-				_, err = redisx.ReadRawReply(c.Reader(), nil)
-			}
-			if err != nil {
-				c.Close()
-				return dst, err
-			}
-		}
-		s.ups[ep.Name] = c
-		up = c
+	}
+	s.ups[ep.Name] = c
+	return c, nil
+}
+
+// forward sends one command to ep. After a route change, upstreams to backends
+// that are no longer in the route are closed (the old writer connection goes away).
+func (s *session) forward(ep *redisx.Endpoint, route Route, epoch uint64, args [][]byte, dst []byte) ([]byte, error) {
+	up, err := s.upstream(ep, route, epoch, args)
+	if err != nil {
+		return dst, err
 	}
 	// A dead backend must fail the command, not hang it: a hung write would keep
 	// PAUSE waiting and the app request open.
