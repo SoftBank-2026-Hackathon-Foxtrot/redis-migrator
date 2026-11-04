@@ -11,7 +11,7 @@ Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 �
 | 구성 요소 | 코드 | 포트 | 역할 |
 |---|---|---|---|
 | Redis 프록시 (Go) | `proxy/cmd/proxy` | RESP `6379`, 관리 `7000` | 앱의 고정 주소. PAUSE, SWITCH, RESUME |
-| Sync Worker (Go) | `proxy/cmd/syncworker` | 관리 `7100` | keyspace 알림과 스캔으로 복사, 역방향 동기화, 값 비교 |
+| Sync Worker (Go) | `proxy/cmd/syncworker` | 관리 `7100` | keyspace 알림과 스캔으로 복사, 역방향 동기화, 버킷 해시와 값 비교 |
 | statemig (FastAPI) | `statemig/` | `8090` | 전환·롤백 단계 실행. 오케스트레이터가 호출 |
 
 ## 지원 범위
@@ -23,6 +23,8 @@ Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 �
 - 사전 점검에서 거부: Cluster 모드, 반대쪽에 없는 db 번호, db 0 밖의 큐, `maxmemory`가 있는데 `noeviction`이 아닌 경우
 
 관리형 Redis는 CONFIG가 막혀 있으므로 keyspace 알림(`KEA`)과 `maxmemory-policy noeviction`을 파라미터 그룹이나 인스턴스 설정으로 켜 둬야 한다. ACL도 막혀 있어서 원본 쓰기 차단은 자격 증명 분리로만 동작한다.
+
+전체 비교와 구독이 끊긴 뒤의 재비교는 Redis 안에서 Lua로 해시를 만들어 비교한다. Lua를 쓸 수 없으면 전체 비교는 값 비교로, 재비교는 전체 복사 뒤 값 비교로 대체한다.
 
 ## 공통 API
 
@@ -96,7 +98,7 @@ ACTIVE → QUIESCED → ROLLED_BACK_HELD → RESTORED → COMPLETED
 |---|---|
 | statemig | `POST /migrations`, `GET /migrations/current/ready`, `POST /migrations/current/{cutover,rollback,commit}`, `GET /status`, `/internal/{prepare,execute,rollback,commit,abort,status}` |
 | 프록시 | `GET /status`, `POST /pause`, `POST /presubscribe`, `POST /switch`, `POST /resume`, `POST /drain-done` |
-| Sync Worker | `GET /status`, `POST /start`, `POST /precompare`, `POST /reconcile`, `POST /verify`, `POST /reverse`, `POST /stop` |
+| Sync Worker | `GET /status`, `POST /start`, `POST /precompare`, `POST /reconcile`, `POST /verify`, `POST /warm`, `POST /reverse`, `POST /stop` |
 
 ## 배포 위치
 
@@ -130,7 +132,7 @@ cd demo && docker compose up -d --build
 | `python demo/loss_report_check.py` | 장애 롤백의 유실 범위 보고 |
 | `python demo/pubsub_check.py` | 전환 중 구독 유지, 메시지 유실·중복 |
 | `sudo python demo/syn_loss_check.py` | SYN이 유실돼도 장애 롤백의 쓰기 정지가 1초 미만 (root, iptables) |
-| `cd proxy && go test ./...` | 멈춘 구독자, 구독 연결의 명령 제한 |
+| `cd proxy && go test ./...` | 멈춘 구독자, 구독 연결의 명령 제한, 파이프라인 전달, 경로 변경 시 재전송, 버킷 비교, 만료 시각 계산 |
 | `python demo/aws_check.py` | 실제 ElastiCache. 같은 VPC의 호스트에서 실행 |
 
 `demo/app`은 검사에서 부하를 거는 앱이다. 실제 공구앱은 [demo 레포](https://github.com/SoftBank-2026-Hackathon-Foxtrot/demo)에 있다.
@@ -141,12 +143,26 @@ ElastiCache for Valkey 8.0, Memorystore for Redis 7.2, 온프레 Valkey 8.0을 T
 
 - 컷오버, 정상 롤백, 연속 이전: 쓰기 정지 210~676ms. 채팅(Pub/Sub) 유실·중복, WebSocket 끊김, 로그인 실패 모두 0건
 - Valkey 8.0과 Redis 7.2 사이의 `DUMP`/`RESTORE`는 양방향으로 동작했다
-- 장애 롤백: 쓰기 정지 0.5~4.1초. 4.1초는 쓰기 정지 안에서 새 연결을 열다 SYN이 유실돼 커널 재시도(1초, 3초)를 기다린 것이다. 로컬에서 같은 4.1초를 재현했고, 연결을 정지 전에 열어 두고 새 연결은 0.3초 만에 재시도하도록 고쳐 57~329ms가 됐다. 실환경 재측정은 하지 않았다
+- 장애 롤백: 쓰기 정지 0.5~4.1초. 4.1초는 쓰기 정지 안에서 새 연결을 열다 SYN이 유실돼 커널 재시도(1초, 3초)를 기다린 것이다. 로컬에서 같은 4.1초를 재현했고, 연결을 정지 전에 열어 두고 새 연결은 0.3초 만에 재시도하도록 고쳐 57~329ms가 됐다. 11월 4일 실환경에서 다시 재서 318~334ms였다
 - 구간별 1~2회, 키 7600개, 구독 3개 이하 규모다. DB·오브젝트·트래픽 계층과의 통합과 오케스트레이터는 포함하지 않았다
+
+## 실환경 재현 (2026-11-04)
+
+`4e06fa3`을 ElastiCache for Valkey 8.0.1과 Memorystore for Redis 7.2.4에 올려 시험했다. 온프레는 포함하지 않았다. 조건과 수치는 [재현 결과](https://app.notion.com/p/40e8bee9ada481e3ba7afffb42227472)에 있다.
+
+- 버킷 비교(Lua)는 두 제품 모두에서 동작했다
+- 컷오버와 정상 롤백: 쓰기 정지 46~61ms. 키 30만 개에서도 61ms, 요청 실패와 세션 유실 0건
+- 네트워크 단절 후 장애 롤백 4회: 쓰기 정지 318~334ms, 롤백 후 요청 실패가 회차마다 1건
+- 대상 구간을 15초 끊으면 키 10개의 TTL이 최대 약 27초 길어졌다
+
+뒤의 두 문제를 `e90b7e1`, `cc948e0`에서 고쳤다. TTL은 로컬에서 같은 단절을 재현해 어긋남이 없어진 것을 확인했다. 롤백 후 요청 실패는 로컬에서 재현되지 않아 단위 테스트로만 확인했다. 둘 다 실환경 재측정은 하지 않았다.
 
 ## 아직 안 된 것
 
 - 오케스트레이터 연결
 - 공통 스펙 확정 후 API 조정
+- `e90b7e1`, `cc948e0`의 실환경 재측정
+- 트랜잭션 중 백엔드 연결이 끊기면, 이후 명령이 새 연결에서 트랜잭션 밖으로 실행될 수 있다. 코드를 읽어 확인했고 재현하지 않았다
+- 프록시가 백엔드에 연결할 때 `AUTH` 응답을 기한 없이 기다린다. 연결만 받고 응답하지 않는 백엔드에서 멈출 수 있다. 코드를 읽어 확인했고 재현하지 않았다
 
 구현이 설계와 다른 점은 [DESIGN.md](DESIGN.md), 온프레 구성은 [onprem/README.md](onprem/README.md)에 있다.

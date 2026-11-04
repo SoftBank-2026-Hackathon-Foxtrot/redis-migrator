@@ -11,9 +11,10 @@ package main
 //   - Per-key ordering: keys are sharded by hash and each shard has one worker,
 //     so two copies of the same key never run concurrently and the last
 //     processed change always decides the result.
-//   - Lost notifications (Pub/Sub has no replay): after every reconnect, and in
-//     the final reconcile, both sides are scanned. Keys present in src are
-//     copied, keys only present in dst are deleted.
+//   - Lost notifications (Pub/Sub has no replay): after every reconnect both sides
+//     are compared by buckets, or scanned if that is not possible, and the final
+//     reconcile of full mode scans them too. Keys that differ or are present only in
+//     src are copied, keys only present in dst are deleted.
 //   - Source restarts: a new run_id on src means its data may be gone, and copying
 //     from an empty src would delete everything on dst. Before any connection to
 //     src is used, a restart with too few keys left halts the sync for good: dst
