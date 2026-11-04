@@ -1414,9 +1414,28 @@ func isPayloadErr(err error) bool {
 
 var b = redisx.B
 
+// expireAt turns a PTTL read with TIME in one MULTI into the source's absolute expiry. A remaining
+// time would start over when the write arrives, and a write can arrive long after the read: a
+// network cut holds it in TCP retransmission, which pushed expiries back by up to a minute.
+func expireAt(now redisx.Value, pttl int64) (int64, error) {
+	if len(now.Arr) != 2 {
+		return 0, errors.New("unexpected TIME reply")
+	}
+	sec, err := strconv.ParseInt(string(now.Arr[0].Str), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	usec, err := strconv.ParseInt(string(now.Arr[1].Str), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return sec*1000 + usec/1000 + pttl, nil
+}
+
 // copyDumpMany: DUMP+PTTL atomically on the source, RESTORE ... REPLACE on the target.
 func copyDumpMany(src, dst *redisx.Conn, keys [][]byte) (copied, deleted int, err error) {
-	read := make([][][]byte, 0, len(keys)*2)
+	read := make([][][]byte, 0, len(keys)*2+1)
+	read = append(read, [][]byte{b("TIME")})
 	for _, k := range keys {
 		read = append(read, [][]byte{b("DUMP"), k}, [][]byte{b("PTTL"), k})
 	}
@@ -1426,16 +1445,21 @@ func copyDumpMany(src, dst *redisx.Conn, keys [][]byte) (copied, deleted int, er
 	}
 	write := make([][][]byte, len(keys))
 	for i, k := range keys {
-		dump, ttl := r[i*2], r[i*2+1].Int
+		dump, ttl := r[i*2+1], r[i*2+2].Int
 		if dump.Null {
 			write[i] = [][]byte{b("DEL"), k}
 			deleted++
 			continue
 		}
 		if ttl < 0 {
-			ttl = 0
+			write[i] = [][]byte{b("RESTORE"), k, b("0"), dump.Str, b("REPLACE")}
+		} else {
+			at, err := expireAt(r[0], ttl)
+			if err != nil {
+				return 0, 0, err
+			}
+			write[i] = [][]byte{b("RESTORE"), k, b(strconv.FormatInt(at, 10)), dump.Str, b("REPLACE"), b("ABSTTL")}
 		}
-		write[i] = [][]byte{b("RESTORE"), k, b(strconv.FormatInt(ttl, 10)), dump.Str, b("REPLACE")}
 		copied++
 	}
 	replies, err := dst.Pipeline(write...)
@@ -1453,7 +1477,7 @@ func copyDumpMany(src, dst *redisx.Conn, keys [][]byte) (copied, deleted int, er
 var errUnsupportedType = errors.New("unsupported type")
 
 // copyLogical: per-type read on the source (in MULTI, with TYPE re-checked) and
-// DEL + rebuild + PEXPIRE in one MULTI on the target.
+// DEL + rebuild + PEXPIREAT in one MULTI on the target.
 func copyLogical(src, dst *redisx.Conn, key []byte) (string, error) {
 	t, err := src.Do(b("TYPE"), key)
 	if err != nil {
@@ -1468,7 +1492,7 @@ func copyLogical(src, dst *redisx.Conn, key []byte) (string, error) {
 	if read == nil {
 		return "", errUnsupportedType
 	}
-	r, err := src.Tx([][]byte{b("TYPE"), key}, read, [][]byte{b("PTTL"), key})
+	r, err := src.Tx([][]byte{b("TYPE"), key}, read, [][]byte{b("PTTL"), key}, [][]byte{b("TIME")})
 	if err != nil {
 		return "", err
 	}
@@ -1520,7 +1544,11 @@ func copyLogical(src, dst *redisx.Conn, key []byte) (string, error) {
 		}
 	}
 	if pttl > 0 {
-		cmds = append(cmds, [][]byte{b("PEXPIRE"), key, b(strconv.FormatInt(pttl, 10))})
+		at, err := expireAt(r[3], pttl)
+		if err != nil {
+			return "", err
+		}
+		cmds = append(cmds, [][]byte{b("PEXPIREAT"), key, b(strconv.FormatInt(at, 10))})
 	}
 	_, err = dst.Tx(cmds...)
 	return "copied", err
