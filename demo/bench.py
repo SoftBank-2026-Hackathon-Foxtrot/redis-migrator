@@ -88,7 +88,7 @@ async def main():
     out = {"label": a.label, "mode": a.mode, "keys": a.keys, "rtt_ms": a.rtt_ms, "until_ready_s": ready_s,
            "paused_ms": res["paused_ms"], "reconcile_ms": res["reconcile_ms"], "verify_ms": res["verify_ms"],
            "reconciled_keys": res["reconciled_keys"], "failed": load.failed, "session_lost": load.session_lost,
-           "max_ms_near_pause": near["max_ms"], "errors": dict(list(load.errors.items())[:3])}
+           "max_ms_near_pause": near["max_ms"], "steps_ms": res.get("steps_ms"), "errors": dict(list(load.errors.items())[:3])}
     print(json.dumps(out, ensure_ascii=False))
     with (Path(__file__).parent / "bench-results.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(out, ensure_ascii=False) + "\n")

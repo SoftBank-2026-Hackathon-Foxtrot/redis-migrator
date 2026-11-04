@@ -47,6 +47,7 @@ func main() {
 	mux.HandleFunc("POST /precompare", s.precompare)
 	mux.HandleFunc("POST /reconcile", s.reconcile)
 	mux.HandleFunc("POST /verify", s.verify)
+	mux.HandleFunc("POST /warm", s.warm)
 	mux.HandleFunc("POST /reverse", s.reverse)
 	mux.HandleFunc("POST /stop", s.stop)
 	addr := os.Getenv("STATEMIG_ADMIN")
@@ -187,6 +188,23 @@ func (s *server) precompare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, res)
+}
+
+func (s *server) warm(w http.ResponseWriter, r *http.Request) {
+	sy := s.current(w)
+	if sy == nil {
+		return
+	}
+	var req struct {
+		Sample map[string]int `json:"sample"`
+	}
+	json.NewDecoder(r.Body).Decode(&req) // empty body: connections only
+	t0 := time.Now()
+	if err := sy.Warm(req.Sample); err != nil {
+		fail(w, 502, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ms": float64(time.Since(t0).Microseconds()) / 1000})
 }
 
 func (s *server) verify(w http.ResponseWriter, r *http.Request) {

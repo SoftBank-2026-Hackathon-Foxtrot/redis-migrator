@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"sort"
 	"strconv"
@@ -37,6 +38,13 @@ type Route struct {
 	Consume *redisx.Endpoint // queue consumer commands
 }
 
+type gateView struct {
+	route Route
+	epoch uint64
+}
+
+func (p *Proxy) publishGate() { p.gate.Store(&gateView{p.route, p.epoch}) } // under mu
+
 // Client is one account allowed to connect to the proxy.
 type Client struct {
 	Password string
@@ -54,12 +62,18 @@ type Proxy struct {
 	epoch    uint64 // bumped on every route change; sessions drop stale upstreams
 	paused   bool
 	pausedAt time.Time
-	inflight int // held-type commands currently at a backend
 	tx       int // sessions inside MULTI/WATCH
 	sessions map[*session]struct{}
 	blockCap int // ms; caps XREADGROUP BLOCK while consume != active
 	// cache keys ("db:key") with a write held at the gate and not finished yet, with how many
 	pendingCache map[string]int
+	// Lock-free view for the common case (not paused, no cache key pending): every command reads
+	// these instead of taking mu. A held command adds itself to inflight and then checks paused
+	// again; Pause sets paused and then waits for inflight to reach 0, so neither misses the other.
+	gate      atomic.Pointer[gateView]
+	pausedA   atomic.Bool
+	pendingN  atomic.Int64 // entries in pendingCache
+	inflightA atomic.Int64
 
 	upstreamTimeout time.Duration // per-command I/O deadline towards a backend
 
@@ -115,6 +129,8 @@ func NewProxy(route Route, paused bool, clients map[string]Client, backends []*r
 		p.pausedAt = time.Now()
 	}
 	p.cond = sync.NewCond(&p.mu)
+	p.pausedA.Store(paused)
+	p.publishGate()
 	p.Stats.LastPauseMs.Store(0.0)
 	p.Stats.MaxPauseMs.Store(0.0)
 	return p, nil
@@ -151,8 +167,27 @@ func (p *Proxy) Route() (Route, bool) {
 // last result lists the cache keys this command holds as pending; pass it back to exit.
 func (p *Proxy) enter(name string, args [][]byte, db int, inTx, resp3 bool) (Route, uint64, bool, []byte, []string) {
 	held := !inTx && !consumeCmds[name] && p.cmds.Held(name)
+	if inTx || (!p.pausedA.Load() && p.pendingN.Load() == 0) { // the common case: no lock
+		if held {
+			p.inflightA.Add(1)
+			if p.pausedA.Load() || p.pendingN.Load() > 0 { // a PAUSE came in between: the slow path decides
+				p.inflightA.Add(-1)
+				return p.enterSlow(name, args, db, held, resp3)
+			}
+		}
+		if g := p.gate.Load(); g != nil {
+			return g.route, g.epoch, held, nil, nil
+		}
+		if held { // built without NewProxy (tests): the locked path has everything
+			p.inflightA.Add(-1)
+		}
+	}
+	return p.enterSlow(name, args, db, held, resp3)
+}
+
+func (p *Proxy) enterSlow(name string, args [][]byte, db int, held, resp3 bool) (Route, uint64, bool, []byte, []string) {
 	p.mu.Lock()
-	if !inTx && (p.paused || len(p.pendingCache) > 0) {
+	if p.paused || len(p.pendingCache) > 0 {
 		if reply := cacheReply(name, args, db, resp3, p.paused, p.pendingCache); reply != nil {
 			p.mu.Unlock()
 			return Route{}, 0, false, reply, nil
@@ -165,6 +200,7 @@ func (p *Proxy) enter(name string, args [][]byte, db int, inTx, resp3 bool) (Rou
 				pk := pendingKey(db, k)
 				pending = append(pending, pk)
 				p.pendingCache[pk]++
+				p.pendingN.Add(1)
 			}
 		}
 		p.Stats.HeldCommands.Add(1)
@@ -173,7 +209,7 @@ func (p *Proxy) enter(name string, args [][]byte, db int, inTx, resp3 bool) (Rou
 		}
 	}
 	if held {
-		p.inflight++
+		p.inflightA.Add(1)
 	}
 	r, e := p.route, p.epoch
 	p.mu.Unlock()
@@ -181,19 +217,20 @@ func (p *Proxy) enter(name string, args [][]byte, db int, inTx, resp3 bool) (Rou
 }
 
 func (p *Proxy) exit(held bool, txDelta int, pending []string) {
-	p.mu.Lock()
 	if held {
-		p.inflight--
+		p.inflightA.Add(-1)
 	}
+	if len(pending) == 0 && txDelta == 0 { // Pause polls inflight: nothing to wake
+		return
+	}
+	p.mu.Lock()
 	for _, k := range pending {
+		p.pendingN.Add(-1)
 		if p.pendingCache[k]--; p.pendingCache[k] <= 0 {
 			delete(p.pendingCache, k)
 		}
 	}
 	p.tx += txDelta
-	if p.paused {
-		p.cond.Broadcast() // Pause may be waiting for inflight/tx to reach 0
-	}
 	p.mu.Unlock()
 }
 
@@ -207,13 +244,15 @@ func (p *Proxy) Pause(maxWait time.Duration) (float64, error) {
 	p.mu.Lock()
 	if !p.paused {
 		p.paused = true
+		p.pausedA.Store(true)
 		p.pausedAt = t0
 	}
 	p.mu.Unlock()
 	for {
 		p.mu.Lock()
-		inflight, tx := p.inflight, p.tx
+		tx := p.tx
 		p.mu.Unlock()
+		inflight := p.inflightA.Load()
 		if inflight == 0 && tx == 0 {
 			return msSince(t0), nil
 		}
@@ -239,6 +278,7 @@ func (p *Proxy) Switch(r Route, moveWait time.Duration) error {
 	old := p.route
 	p.route = r
 	p.epoch++
+	p.publishGate()
 	var subs []*session
 	for s := range p.sessions {
 		if s.pubsub.Load() && s.sub.Load() == nil { // MONITOR, SSUBSCRIBE: not moved, the client resubscribes
@@ -266,6 +306,7 @@ func (p *Proxy) DrainDone(gen uint64, consume *redisx.Endpoint) error {
 	log.Printf("drain done gen %d: consume %s→%s", gen, p.route.Consume.Name, consume.Name)
 	p.route.Consume = consume
 	p.epoch++
+	p.publishGate()
 	return nil
 }
 
@@ -276,6 +317,7 @@ func (p *Proxy) Resume() float64 {
 		return 0
 	}
 	p.paused = false
+	p.pausedA.Store(false)
 	ms := msSince(p.pausedAt)
 	p.cond.Broadcast()
 	active := p.route.Active.Name
@@ -293,7 +335,7 @@ func (p *Proxy) Status() map[string]any {
 	p.mu.Lock()
 	st := map[string]any{
 		"gen": p.route.Gen, "active": p.route.Active.Name, "consume": p.route.Consume.Name,
-		"paused": p.paused, "inflight_writes": p.inflight, "open_tx": p.tx, "clients": len(p.sessions),
+		"paused": p.paused, "inflight_writes": p.inflightA.Load(), "open_tx": p.tx, "clients": len(p.sessions),
 	}
 	p.mu.Unlock()
 	st["commands"] = p.Stats.Commands.Load()
@@ -647,30 +689,26 @@ func (s *session) pipe(up *redisx.Conn) {
 // ---- latency -------------------------------------------------------------------
 
 type latencyWindow struct {
-	mu  sync.Mutex
-	buf []float64
-	i   int
-	n   int
+	buf []atomic.Uint64 // float64 bits of the last len(buf) latencies, in ms
+	n   atomic.Uint64   // how many were ever added
 }
 
-func newLatencyWindow(n int) *latencyWindow { return &latencyWindow{buf: make([]float64, n)} }
+func newLatencyWindow(n int) *latencyWindow { return &latencyWindow{buf: make([]atomic.Uint64, n)} }
 
+// add is lock-free: every command records one, from every session at once.
 func (l *latencyWindow) add(d time.Duration) {
-	l.mu.Lock()
-	l.buf[l.i] = float64(d.Microseconds()) / 1000
-	l.i = (l.i + 1) % len(l.buf)
-	if l.n < len(l.buf) {
-		l.n++
-	}
-	l.mu.Unlock()
+	i := l.n.Add(1) - 1
+	l.buf[i%uint64(len(l.buf))].Store(math.Float64bits(float64(d.Microseconds()) / 1000))
 }
 
 func (l *latencyWindow) summary() map[string]float64 {
-	l.mu.Lock()
-	xs := append([]float64(nil), l.buf[:l.n]...)
-	l.mu.Unlock()
-	if len(xs) == 0 {
+	n := min(l.n.Load(), uint64(len(l.buf)))
+	if n == 0 {
 		return map[string]float64{}
+	}
+	xs := make([]float64, n)
+	for i := range xs {
+		xs[i] = math.Float64frombits(l.buf[i].Load())
 	}
 	sort.Float64s(xs)
 	q := func(f float64) float64 { return xs[min(int(f*float64(len(xs))), len(xs)-1)] }

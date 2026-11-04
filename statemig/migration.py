@@ -131,6 +131,7 @@ class Migration:
         self.abort_reason: str | None = None
         self._lock = asyncio.Lock()
         self._admins: dict = {}     # (endpoint, db) -> admin connection used inside write pauses
+        self._spublish: dict = {}   # endpoint -> whether it knows SPUBLISH, asked before a pause
 
     def retire(self):
         """A newer migration replaces this one: its background loops end, its saved file is reused."""
@@ -147,21 +148,32 @@ class Migration:
             self._admins[key] = ep.admin_client(db)
         return self._admins[key]
 
-    async def _warm(self, *eps: Endpoint) -> dict:
-        """Opens (or checks) the admin connections of eps, for every db that holds keys. A side
-        that does not answer is skipped: in a failure rollback the target is dead."""
+    async def _warm(self, *eps: Endpoint, sync: bool = False) -> dict:
+        """Opens (or checks) the admin connections of eps, for every db that holds keys, and the
+        Sync Worker's if sync. A side that does not answer is skipped: in a failure rollback the target
+        is dead."""
         out = {}
 
         async def one(ep: Endpoint):
             try:
                 c = self._admin(ep)
                 await c.ping()
-                for db in _dbs(await c.info("keyspace")):
-                    await self._admin(ep, db).ping()
+                self._spublish[ep.name] = await _has_spublish(c)
+                await asyncio.gather(*(self._admin(ep, db).ping() for db in _dbs(await c.info("keyspace"))))
                 out[ep.name] = "ok"
             except Exception as e:  # noqa: BLE001
                 out[ep.name] = _why(e)
-        await asyncio.gather(*(one(ep) for ep in eps))
+
+        async def sync_pool():
+            if not sync:
+                return
+            try:
+                # delta mode: the verify's sample keys are picked now too, the pause only compares
+                await self.sync.call("POST", "/warm", {"sample": VERIFY_DELTA["sample"] if self.mode == "delta" else {}},
+                                     timeout=10)
+            except Exception as e:  # noqa: BLE001  it dials inside the pause instead
+                out["sync"] = _why(e)
+        await asyncio.gather(sync_pool(), *(one(ep) for ep in eps))
         return out
 
     @property
@@ -353,12 +365,20 @@ class Migration:
         """PAUSE … RESUME, shared by cutover and normal rollback."""
         if self.mode == "delta":
             await self.before_pause(budget_ms)
-        await self._warm(old, new)      # writes still flow: connection setup costs no pause
+        await self._warm(old, new, sync=True)      # writes still flow: connection setup costs no pause
         t0 = time.monotonic()
         spent = lambda: (time.monotonic() - t0) * 1000  # noqa: E731
         left = lambda: max(100, int(budget_ms - spent()))  # noqa: E731
         rec = self.record.read()
         timings: dict = {}
+        steps: dict = {}
+        mark = [t0]
+
+        def lap(name: str):
+            now = time.monotonic()
+            steps[name] = round((now - mark[0]) * 1000, 1)
+            mark[0] = now
+        timings["steps_ms"] = steps
 
         # 1. PAUSE
         self.switching = {"old": old.name, "new": new.name, "kind": kind, "gen0": rec["gen"]}
@@ -367,10 +387,12 @@ class Migration:
         try:
             p = await self.proxy.call("POST", "/pause", {"max_wait_ms": left()})
             timings["pause_wait_ms"] = p["waited_ms"]
+            lap("pause")
             # 2. FINAL RECONCILE
             rc = await self.sync.call("POST", "/reconcile", {"deadline_ms": left(), "mode": self.mode},
                                       timeout=left() / 1000 + 1)
             timings["reconcile_ms"], timings["reconciled_keys"] = rc["ms"], rc["scanned"]
+            lap("reconcile")
             # 3. VERIFY
             v = await self.sync.call("POST", "/verify",
                                      {**(VERIFY_DELTA if self.mode == "delta" else VERIFY), "deadline_ms": left()},
@@ -378,11 +400,14 @@ class Migration:
             timings["verify_ms"] = v["ms"]
             if not v["ok"]:
                 raise MigrationError(f"verify failed: {v['prefixes']}")
+            lap("verify")
             if missing := await _missing_groups(new, self._admin(new)):
                 raise MigrationError(f"verify failed: no queue group on {new.name}: {missing}")
+            lap("groups")
             # PRESUBSCRIBE: every subscribed client gets the same subscriptions on the new side now,
             # while nothing is published; one that cannot calls the cutover off with nothing changed.
             timings["presubscribed"] = await self._presubscribe(new, left)
+            lap("presubscribe")
             if spent() > budget_ms:     # the steps left are quick; past the budget, writes come first
                 raise MigrationError(f"budget exceeded: {round(spent())}ms > {budget_ms}ms before the switch")
         except (MigrationError, httpx.HTTPError) as e:
@@ -395,8 +420,9 @@ class Migration:
         # 4. SWITCH: record first; from here on forward, or a full revert
         gen = rec["gen"] + 1
         self.record.write(gen=gen, active=new.name, consume=old.name, paused=True)
+        lap("record")
         try:
-            await self._finish_switch(old, new, gen, timings, left)
+            await self._finish_switch(old, new, gen, timings, left, lap)
         except Exception as e:  # noqa: BLE001
             try:
                 await self._revert(old, new, gen, kind, _why(e))
@@ -421,7 +447,7 @@ class Migration:
                     raise
                 await asyncio.sleep(0.2)
 
-    async def _finish_switch(self, old: Endpoint, new: Endpoint, gen: int, timings: dict, left):
+    async def _finish_switch(self, old: Endpoint, new: Endpoint, gen: int, timings: dict, left, lap=lambda _: None):
         """Steps 4–7. Safe to run again: a restart converges by calling this once more."""
         while True:
             try:
@@ -440,19 +466,29 @@ class Migration:
                 if left() <= 100:
                     raise MigrationError(f"switch to gen {gen} not applied: {e}") from e
                 await asyncio.sleep(0.2)
-        # 5. FENCE SOURCE: the app user may only consume queues on the old side
-        timings["fence"] = await self._fence_old(old)
-        await self._set_write(new, True)
-        # 6. REVERSE SYNC (subscription confirmed before any write reaches the new side)
-        await self.sync.call("POST", "/reverse", {"src": new.name, "deadline_ms": max(1000, left())})
+        lap("switch")
+        # 5. FENCE SOURCE (the app user may only consume queues on the old side), open the new
+        # side, 6. REVERSE SYNC (subscription confirmed before any write reaches the new side).
+        # Independent of each other and all done before RESUME: run at once, a round trip for all.
+        fence, unfence, reverse = await asyncio.gather(
+            self._fence_old(old), self._set_write(new, True),
+            self.sync.call("POST", "/reverse", {"src": new.name, "deadline_ms": max(1000, left())}),
+            return_exceptions=True)
+        for e in (unfence, reverse):   # all finished: a revert does not race a step still running
+            if isinstance(e, BaseException):
+                raise e
+        timings["fence"] = fence if not isinstance(fence, BaseException) else _why(fence)
+        lap("fence_unfence_reverse")
         # 7. RESUME, after checking the proxy really is on the recorded generation
         st = (await self.proxy.call("GET", "/status"))["proxy"]
         if st["gen"] != gen or st["active"] != new.name:
             raise MigrationError(f"proxy not on recorded gen {gen}: {st}")
+        lap("status")
         self.record.write(gen=gen, active=new.name, consume=old.name, paused=False)
         timings["gen"] = gen
         try:
             r = await self.proxy.call("POST", "/resume")
+            lap("resume")
             timings["paused_ms"] = r["paused_ms"]
         except Exception as e:  # noqa: BLE001  the record already says resumed: no way back from here
             timings["paused_ms"] = None    # a restarted proxy starts unpaused, the watch covers the rest
@@ -848,14 +884,18 @@ class Migration:
         rules = ["on", "~*", "&*", "+@all"]
         if not allowed:
             rules += ["-@write", "-publish", *CONSUME_CMDS.split()]
-            if await _has_spublish(c):
+            if self._spublish.get(ep.name) is None:
+                self._spublish[ep.name] = await _has_spublish(c)
+            if self._spublish[ep.name]:
                 rules.append("-spublish")
-        await c.execute_command("ACL", "SETUSER", self.app_user, *rules)
-        try:
-            await c.execute_command("ACL", "SAVE")
-        except ResponseError as e:
-            if "not configured" not in str(e):   # no aclfile: precheck already warned
-                raise
+        async with c.pipeline(transaction=False) as p:   # one round trip
+            p.execute_command("ACL", "SETUSER", self.app_user, *rules)
+            p.execute_command("ACL", "SAVE")
+            setuser, save = await p.execute(raise_on_error=False)
+        if isinstance(setuser, Exception):
+            raise setuser
+        if isinstance(save, Exception) and "not configured" not in str(save):   # no aclfile: precheck warned
+            raise save
 
 
 async def _has_spublish(c) -> bool:

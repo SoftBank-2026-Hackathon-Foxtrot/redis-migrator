@@ -74,6 +74,9 @@ type Syncer struct {
 	mu       sync.Mutex
 	src, dst *redisx.Endpoint
 	dirEpoch uint64 // bumped on reverse; workers reopen their connections
+
+	sampleMu sync.Mutex
+	samples  *presample // picked by Warm, just before a pause
 	stopped  bool
 	sub      *redisx.Conn // current subscription connection
 
@@ -1166,12 +1169,13 @@ func (s *Syncer) ReconcileDelta(deadline time.Time) (int, error) {
 	s.barrierSeen = seen
 	s.barrierMu.Unlock()
 	srcEP, _, _ := s.dir()
-	src, err := srcEP.Dial(0)
-	if err != nil {
-		return 0, err
-	}
-	defer src.Close()
-	if _, err := src.DoStr("SET", barrierKey, strconv.FormatInt(time.Now().UnixNano(), 10), "PX", "10000"); err != nil {
+	if err := pool.withConn(srcEP, func(src *redisx.Conn) error {
+		if err := src.Select(0); err != nil { // pooled: may be on another db
+			return err
+		}
+		_, err := src.DoStr("SET", barrierKey, strconv.FormatInt(time.Now().UnixNano(), 10), "PX", "10000")
+		return err
+	}); err != nil {
 		return 0, err
 	}
 	select {
@@ -1187,6 +1191,73 @@ func (s *Syncer) ReconcileDelta(deadline time.Time) (int, error) {
 		return 0, errors.New("drain timeout (backlog " + strconv.Itoa(n) + ")")
 	}
 	return s.deltaSize(), nil
+}
+
+// Warm fills the connection pool for both sides, for the steps of the coming write pause, and
+// picks the verify's sample keys: which keys get compared does not need writes paused, only the
+// comparison does, and scanning for them takes round trips in proportion to all the keys.
+func (s *Syncer) Warm(sample map[string]int) error {
+	srcEP, dstEP, epoch := s.dir()
+	errs := make(chan error, 2)
+	for _, ep := range []*redisx.Endpoint{srcEP, dstEP} {
+		go func() { errs <- pool.warm(ep) }()
+	}
+	if err := errors.Join(<-errs, <-errs); err != nil {
+		return err
+	}
+	if len(sample) == 0 {
+		return nil
+	}
+	ps := &presample{at: time.Now(), epoch: epoch, keys: map[string][]string{}}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var scanErr error
+	var dbs []int
+	if err := pool.withConn(srcEP, func(c *redisx.Conn) (err error) { dbs, err = dbsOf(c); return }); err != nil {
+		return err
+	}
+	for p, n := range sample {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ks, err := sampleKeys(srcEP, dbs, p, n)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				scanErr = err
+				return
+			}
+			ps.keys[p+"#"+strconv.Itoa(n)] = ks
+		}()
+	}
+	wg.Wait()
+	if scanErr != nil {
+		return scanErr
+	}
+	s.sampleMu.Lock()
+	s.samples = ps
+	s.sampleMu.Unlock()
+	return nil
+}
+
+type presample struct {
+	at    time.Time
+	epoch uint64
+	keys  map[string][]string // "prefix#n" -> db-qualified keys
+}
+
+// presampled returns the keys Warm picked for prefix p, if they are recent and still for this
+// direction.
+func (s *Syncer) presampled(p string, n int) ([]string, bool) {
+	_, _, epoch := s.dir()
+	s.sampleMu.Lock()
+	defer s.sampleMu.Unlock()
+	ps := s.samples
+	if ps == nil || ps.epoch != epoch || time.Since(ps.at) > poolIdleMax {
+		return nil, false
+	}
+	ks, ok := ps.keys[p+"#"+strconv.Itoa(n)]
+	return ks, ok
 }
 
 func (s *Syncer) isStopped() bool {
