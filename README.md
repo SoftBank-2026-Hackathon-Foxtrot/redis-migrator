@@ -226,7 +226,5 @@ ElastiCache for Valkey 8.0, Memorystore for Redis 7.2, 온프레 Valkey 8.0을 T
 - 오케스트레이터 연결
 - 공통 스펙 확정 후 API 조정
 - `e90b7e1`, `cc948e0`의 실환경 재측정
-- 트랜잭션 중 백엔드 연결이 끊기면, 이후 명령이 새 연결에서 트랜잭션 밖으로 실행될 수 있다. 코드를 읽어 확인했고 재현하지 않았다
-- 프록시가 백엔드에 연결할 때 `AUTH` 응답을 기한 없이 기다린다. 연결만 받고 응답하지 않는 백엔드에서 멈출 수 있다. 코드를 읽어 확인했고 재현하지 않았다
 
 구현이 설계와 다른 점은 [DESIGN.md](DESIGN.md), 온프레 구성은 [onprem/README.md](onprem/README.md)에 있다.
