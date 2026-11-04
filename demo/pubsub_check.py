@@ -90,6 +90,9 @@ class Publisher(threading.Thread):
 
 
 def check(subs, pub, label, since=0.0, until=1e18, may_miss_between=None):
+    # Only what was acknowledged a while ago: the latest publish may still be on its way to a
+    # subscriber while the publisher keeps going, which is not a loss.
+    until = min(until, time.time() - 0.5)
     want = [s for s, t in pub.acked if since <= t <= until]
     for s in subs:
         got = [x for x in s.got if want and want[0] <= x <= want[-1]]
@@ -99,7 +102,7 @@ def check(subs, pub, label, since=0.0, until=1e18, may_miss_between=None):
         lost = [m for m in missing if m not in excused]
         rc.report(f"{label}: {s.name} 유실·중복 없음, 연결 유지", not lost and not dup and s.dropped is None,
                   f"보낸 {len(want)}, 받은 {len(got)}, 유실 {len(lost)}, 중복 {dup}, 장애 구간 유실 {len(excused)}, "
-                  f"끊김 {s.dropped}")
+                  f"끊김 {s.dropped}" + (f", 빠진 번호 {lost[:5]} (마지막 발행 {want[-1]})" if lost else ""))
 
 
 def proxy_stats() -> dict:
