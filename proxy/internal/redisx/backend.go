@@ -58,8 +58,15 @@ type Conn struct {
 	db int // the db this connection is on, as far as Select knows
 }
 
+// Dial bounds the whole dial, AUTH and SELECT included, and leaves no deadline on the connection:
+// a backend that takes the connection and never answers must fail here, not hang the caller.
 func (e *Endpoint) Dial(db int) (*Conn, error) {
-	return e.dial(db, 5*time.Second, time.Time{})
+	c, err := e.dial(db, 5*time.Second, time.Now().Add(5*time.Second))
+	if err != nil {
+		return nil, err
+	}
+	c.nc.SetDeadline(time.Time{})
+	return c, nil
 }
 
 // DialWithin bounds the whole dial, AUTH and SELECT included. The deadline stays on the connection:

@@ -631,6 +631,14 @@ func (s *session) run() {
 		}
 		s.reply(buf)
 
+		// Redis drops a transaction with its connection. Tell the client the same way: if this
+		// session stayed open, what it sends next would run outside any transaction, on a new
+		// connection. The same goes for the commands pipelined behind a MULTI that failed.
+		if err != nil && (wasTx || name == "multi" || name == "watch") {
+			s.cw.Flush()
+			return
+		}
+
 		if movableSubCmds[name] && len(buf) > 0 && buf[0] != '-' {
 			s.pubsub.Store(true)
 			s.subscribed(ep, name, args)
@@ -720,6 +728,9 @@ func (s *session) upstream(ep *redisx.Endpoint, route Route, epoch uint64, args 
 		return nil, err
 	}
 	if s.hello != nil && !strings.EqualFold(string(args[0]), "hello") {
+		if d := s.p.upstreamTimeout; d > 0 { // the caller sets its own before the command itself
+			c.NetConn().SetDeadline(time.Now().Add(d))
+		}
 		redisx.WriteCommand(c.Writer(), s.hello...)
 		if err := c.Writer().Flush(); err == nil {
 			_, err = redisx.ReadRawReply(c.Reader(), nil)
