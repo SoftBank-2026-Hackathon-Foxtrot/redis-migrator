@@ -590,6 +590,23 @@ func (s *session) run() {
 			}
 		}
 		buf, err = s.forward(ep, route, epoch, args, buf[:0])
+		// The route moved while this waited on a dial to a dead backend (a dial takes seconds, a
+		// failure rollback less). Nothing was sent, so it can go again on the current route; inside
+		// a transaction it can't, the transaction is on the backend it started on.
+		if errors.Is(err, errNotSent) && !wasTx && p.routeMoved(epoch) {
+			p.exit(held, 0, pending)
+			route, epoch, held, answered, pending = p.enter(name, args, s.db, false, s.resp3())
+			if answered != nil {
+				p.Stats.CacheBypassed.Add(1)
+				s.reply(answered)
+				continue
+			}
+			ep = route.Active
+			if consumeCmds[name] {
+				ep = route.Consume
+			}
+			buf, err = s.forward(ep, route, epoch, args, buf[:0])
+		}
 		if err != nil {
 			p.Stats.UpstreamErrors.Add(1)
 			buf = append(buf[:0], redisx.ErrorReply("ERR upstream unavailable: "+err.Error())...)
@@ -716,12 +733,22 @@ func (s *session) upstream(ep *redisx.Endpoint, route Route, epoch uint64, args 
 	return c, nil
 }
 
+// errNotSent is a forward that failed before the command reached the backend.
+var errNotSent = errors.New("not sent")
+
+// routeMoved says whether the route changed since epoch.
+func (p *Proxy) routeMoved(epoch uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.epoch != epoch
+}
+
 // forward sends one command to ep. After a route change, upstreams to backends
 // that are no longer in the route are closed (the old writer connection goes away).
 func (s *session) forward(ep *redisx.Endpoint, route Route, epoch uint64, args [][]byte, dst []byte) ([]byte, error) {
 	up, err := s.upstream(ep, route, epoch, args)
 	if err != nil {
-		return dst, err
+		return dst, fmt.Errorf("%w: %w", errNotSent, err)
 	}
 	// A dead backend must fail the command, not hang it: a hung write would keep
 	// PAUSE waiting and the app request open.
