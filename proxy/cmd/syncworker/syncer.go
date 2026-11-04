@@ -518,12 +518,8 @@ func (s *Syncer) subscriber(src *redisx.Endpoint, epoch uint64, confirmed chan s
 		} else {
 			// notifications sent while we were disconnected are gone
 			s.resyncs.Add(1)
-			log.Printf("resubscribed to %s: full two-sided rescan", src.Name)
-			go func() {
-				if _, err := s.FullScan(); err == nil && !s.silent.Load() {
-					s.writtenWhileDown.Store(false)
-				}
-			}()
+			log.Printf("resubscribed to %s: two-sided rescan", src.Name)
+			go s.rescan()
 		}
 		for {
 			v, err := redisx.ReadValue(c.Reader())
@@ -558,6 +554,37 @@ func (s *Syncer) closeSub() {
 		s.sub = nil
 	}
 	s.mu.Unlock()
+}
+
+// rescan finds what changed while no notification came. By buckets it moves only the keys that
+// differ, and counts as a precompare. Without the script, every key is copied again and the
+// next precompare compares them all.
+func (s *Syncer) rescan() {
+	s.scansRunning.Add(1)
+	defer s.scansRunning.Add(-1)
+	for !s.comparing.CompareAndSwap(false, true) { // a precompare in flight fails: the subscription dropped
+		if s.isStopped() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	res, err := s.precompareLocked(time.Now().Add(time.Hour), false)
+	s.comparing.Store(false)
+	if err == nil {
+		if !s.silent.Load() {
+			s.writtenWhileDown.Store(false)
+		}
+		s.lastFullScan.Store(time.Now().UnixMilli())
+		log.Printf("rescan by buckets: %v", res)
+		return
+	}
+	if s.isStopped() || s.haltReason() != "" {
+		return
+	}
+	log.Printf("rescan by buckets failed (%v): every key again", err)
+	if _, err := s.FullScan(); err == nil && !s.silent.Load() {
+		s.writtenWhileDown.Store(false)
+	}
 }
 
 // FullScan enqueues every included key of src, and the keys only dst has (to delete them).
@@ -1081,6 +1108,12 @@ func (s *Syncer) Precompare(deadline time.Time) (map[string]any, error) {
 		return nil, errors.New("precompare already running")
 	}
 	defer s.comparing.Store(false)
+	return s.precompareLocked(deadline, true)
+}
+
+// precompareLocked runs with comparing held. By buckets when the script runs on both sides;
+// otherwise, if allowed, value by value.
+func (s *Syncer) precompareLocked(deadline time.Time, byValue bool) (map[string]any, error) {
 	t0 := time.Now()
 	base := s.resyncs.Load()
 	s.comparedResync.Store(-1)
@@ -1097,6 +1130,24 @@ func (s *Syncer) Precompare(deadline time.Time) (map[string]any, error) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	res, err := s.bucketCompare(deadline)
+	if errors.Is(err, errNoBuckets) && byValue {
+		log.Printf("bucket compare unavailable (%v): comparing value by value", err)
+		res, err = s.compareByValue(deadline, t0)
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.lastCompare.Store(res)
+	if s.resyncs.Load() != base {
+		return res, errors.New("precompare: subscription dropped during the pass")
+	}
+	s.comparedResync.Store(base)
+	return res, nil
+}
+
+// compareByValue reads every key on both sides: what the bucket compare avoids.
+func (s *Syncer) compareByValue(deadline, t0 time.Time) (map[string]any, error) {
 	srcEP, dstEP, _ := s.dir()
 	src, err := srcEP.Dial(0)
 	if err != nil {
@@ -1150,13 +1201,8 @@ func (s *Syncer) Precompare(deadline time.Time) (map[string]any, error) {
 		s.Mark(k)
 	}
 	s.storeCompareRate(compared, time.Since(t0))
-	res := map[string]any{"compared": compared, "differed": differed, "ms": float64(time.Since(t0).Microseconds()) / 1000}
-	s.lastCompare.Store(res)
-	if s.resyncs.Load() != base {
-		return res, errors.New("precompare: subscription dropped during the pass")
-	}
-	s.comparedResync.Store(base)
-	return res, nil
+	return map[string]any{"method": "values", "compared": compared, "differed": differed,
+		"ms": float64(time.Since(t0).Microseconds()) / 1000}, nil
 }
 
 func (s *Syncer) barrierArrived() {
