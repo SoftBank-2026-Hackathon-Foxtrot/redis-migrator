@@ -74,9 +74,9 @@ async def set_write(self, ep, allowed):
     await hit("after:" + tag)
 
 
-async def drop_prefix(ep, prefix):
+async def drop_prefix(ep, prefix, *args):
     await hit("before:dropcache")
-    res = await _drop(ep, prefix)
+    res = await _drop(ep, prefix, *args)
     await hit("after:dropcache")
     return res
 

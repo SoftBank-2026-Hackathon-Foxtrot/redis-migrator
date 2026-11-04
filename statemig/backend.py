@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from urllib.parse import unquote, urlparse
 
 import redis.asyncio as aioredis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 
 @dataclass
@@ -27,6 +29,18 @@ class Endpoint:
 
     def public(self) -> dict:
         return {"name": self.name, "host": self.host, "port": self.port, "tls": self.tls}
+
+    def admin_client(self, db: int = 0) -> aioredis.Redis:
+        """For the steps inside a write pause. Opened and checked before it (Migration._warm), then
+        reused. A connect that does not answer is retried after 0.3s instead of waiting on the
+        kernel's SYN retry (1s, then 3s): one lost SYN held every write for 1 to 3s otherwise."""
+        return aioredis.Redis(
+            host=self.host, port=self.port, db=db,
+            username=self.username, password=self.password,
+            ssl=self.tls, ssl_cert_reqs="none" if self.tls else None,
+            socket_connect_timeout=0.3, socket_timeout=10, health_check_interval=5,
+            retry=Retry(NoBackoff(), 6), decode_responses=False,
+        )
 
     def client(self, db: int = 0) -> aioredis.Redis:
         """redis-py client for control-plane checks (precheck, verify)."""

@@ -130,10 +130,39 @@ class Migration:
         self.ready_by: float | None = None      # unix time: not ready by then means give up
         self.abort_reason: str | None = None
         self._lock = asyncio.Lock()
+        self._admins: dict = {}     # (endpoint, db) -> admin connection used inside write pauses
 
     def retire(self):
         """A newer migration replaces this one: its background loops end, its saved file is reused."""
         self._state = "REPLACED"
+        for c in self._admins.values():
+            asyncio.create_task(c.aclose())
+        self._admins.clear()
+
+    # ---- connections used inside a write pause -----------------------------------------
+    def _admin(self, ep: Endpoint, db: int = 0):
+        """A pause must not wait on a new TCP connection: these are opened before it and reused."""
+        key = (ep.name, db)
+        if key not in self._admins:
+            self._admins[key] = ep.admin_client(db)
+        return self._admins[key]
+
+    async def _warm(self, *eps: Endpoint) -> dict:
+        """Opens (or checks) the admin connections of eps, for every db that holds keys. A side
+        that does not answer is skipped: in a failure rollback the target is dead."""
+        out = {}
+
+        async def one(ep: Endpoint):
+            try:
+                c = self._admin(ep)
+                await c.ping()
+                for db in _dbs(await c.info("keyspace")):
+                    await self._admin(ep, db).ping()
+                out[ep.name] = "ok"
+            except Exception as e:  # noqa: BLE001
+                out[ep.name] = _why(e)
+        await asyncio.gather(*(one(ep) for ep in eps))
+        return out
 
     @property
     def state(self) -> str:
@@ -322,6 +351,7 @@ class Migration:
         """PAUSE … RESUME, shared by cutover and normal rollback."""
         if self.mode == "delta":
             await self.before_pause(budget_ms)
+        await self._warm(old, new)      # writes still flow: connection setup costs no pause
         t0 = time.monotonic()
         spent = lambda: (time.monotonic() - t0) * 1000  # noqa: E731
         left = lambda: max(100, int(budget_ms - spent()))  # noqa: E731
@@ -346,7 +376,7 @@ class Migration:
             timings["verify_ms"] = v["ms"]
             if not v["ok"]:
                 raise MigrationError(f"verify failed: {v['prefixes']}")
-            if missing := await _missing_groups(new):
+            if missing := await _missing_groups(new, self._admin(new)):
                 raise MigrationError(f"verify failed: no queue group on {new.name}: {missing}")
             # PRESUBSCRIBE: every subscribed client gets the same subscriptions on the new side now,
             # while nothing is published; one that cannot calls the cutover off with nothing changed.
@@ -572,8 +602,17 @@ class Migration:
         Safe to run again: a restart or the watch finishes it from the saved switching."""
         t0 = time.monotonic()
         res: dict = {"mode": "failure"}
+        steps = res["steps_ms"] = {}    # where the time went, for the write pause in particular
+        mark = [t0]
+
+        def lap(name: str):
+            now = time.monotonic()
+            steps[name] = round((now - mark[0]) * 1000, 1)
+            mark[0] = now
         self.switching = {"old": self.target.name, "new": self.source.name, "kind": "failure"}
         self._save()
+        # Connect to the source alongside the first steps, not inside the pause after them.
+        warm = asyncio.create_task(self._warm(self.source))
         try:
             status = await self.sync.call("GET", "/status", timeout=FAILURE_STATUS_TIMEOUT_S)
             st = status.get("sync", {})
@@ -591,6 +630,7 @@ class Migration:
                 res["reverse_subscription_down_ms"] = st.get("subscription_down_ms")
         except Exception as e:  # noqa: BLE001
             res["reverse_backlog_at_failure"] = f"unknown: {_why(e)}"
+        lap("sync_status")
         rec = self.record.read()
         gen = rec["gen"]
         if rec["active"] != self.source.name:
@@ -600,12 +640,20 @@ class Migration:
             except MigrationError as e:
                 res["pause_note"] = str(e)
             gen += 1
+        lap("pause")
         self.record.write(gen=gen, active=self.source.name, consume=self.source.name, paused=True)
         await self._apply_route(gen)
+        lap("switch")
+        res["warm"] = await warm
+        lap("warm")
         await self._set_write(self.source, True)
-        res["cache_keys_dropped"] = await _drop_prefix(self.source, "cache:")
+        lap("unfence")
+        res["cache_keys_dropped"] = await _drop_prefix(self.source, "cache:", steps,
+                                                       lambda db: self._admin(self.source, db))
+        lap("drop_cache")
         self.record.write(gen=gen, active=self.source.name, consume=self.source.name, paused=False)
         r = await self.proxy.call("POST", "/resume")
+        lap("resume")
         if self.drain_task:
             self.drain_task.cancel()
         # outside the pause: its workers may still be timing out against the dead target
@@ -787,26 +835,24 @@ class Migration:
     # ---- permissions ------------------------------------------------------------------
     async def _set_write(self, ep: Endpoint, allowed: bool):
         """FENCE: take data writes away from the app user, keep queue consumption.
-        The user's password is left alone: each Redis has its own."""
+        The user's password is left alone: each Redis has its own. Runs inside a write pause, on
+        the admin connection opened before it."""
         if self.fence_mode.get(ep.name) == "isolated":
             return
-        c = ep.client()
+        c = self._admin(ep)
+        # PUBLISH is not in @write: it is taken away too, or a client off the proxy could still
+        # publish to a side nobody subscribes to any more.
+        rules = ["on", "~*", "&*", "+@all"]
+        if not allowed:
+            rules += ["-@write", "-publish", *CONSUME_CMDS.split()]
+            if await _has_spublish(c):
+                rules.append("-spublish")
+        await c.execute_command("ACL", "SETUSER", self.app_user, *rules)
         try:
-            # PUBLISH is not in @write: it is taken away too, or a client off the proxy could still
-            # publish to a side nobody subscribes to any more.
-            rules = ["on", "~*", "&*", "+@all"]
-            if not allowed:
-                rules += ["-@write", "-publish", *CONSUME_CMDS.split()]
-                if await _has_spublish(c):
-                    rules.append("-spublish")
-            await c.execute_command("ACL", "SETUSER", self.app_user, *rules)
-            try:
-                await c.execute_command("ACL", "SAVE")
-            except ResponseError as e:
-                if "not configured" not in str(e):   # no aclfile: precheck already warned
-                    raise
-        finally:
-            await c.aclose()
+            await c.execute_command("ACL", "SAVE")
+        except ResponseError as e:
+            if "not configured" not in str(e):   # no aclfile: precheck already warned
+                raise
 
 
 async def _has_spublish(c) -> bool:
@@ -963,8 +1009,8 @@ async def _ensure_groups(ep: Endpoint):
         await c.aclose()
 
 
-async def _missing_groups(ep: Endpoint) -> list[str]:
-    c = ep.client()
+async def _missing_groups(ep: Endpoint, client=None) -> list[str]:
+    c = client or ep.client()
     missing = []
     try:
         for s in STREAMS:
@@ -975,7 +1021,8 @@ async def _missing_groups(ep: Endpoint) -> list[str]:
             if GROUP.encode() not in names and GROUP not in names:
                 missing.append(s)
     finally:
-        await c.aclose()
+        if client is None:
+            await c.aclose()
     return missing
 
 
@@ -1001,17 +1048,25 @@ async def _queues_empty(c) -> bool:
     return True
 
 
-async def _drop_prefix(ep: Endpoint, prefix: str) -> int:
-    """In every db: a db keeps its number across a migration, and so does its cache."""
-    c = ep.client()
+async def _drop_prefix(ep: Endpoint, prefix: str, steps: dict | None = None, client_for=None) -> int:
+    """In every db: a db keeps its number across a migration, and so does its cache. client_for(db)
+    gives connections opened before the write pause; without it, new ones are opened and closed."""
+    steps = {} if steps is None else steps
+    owned = client_for is None
+    client_for = client_for or ep.client
+    t = time.monotonic()
+    c = client_for(0)
     try:
         dbs = _dbs(await c.info("keyspace"))
     finally:
-        await c.aclose()
+        if owned:
+            await c.aclose()
+    steps["drop_info"] = round((time.monotonic() - t) * 1000, 1)
     n = 0
     for db in dbs:
-        c = ep.client(db)
+        c = client_for(db)
         try:
+            t = time.monotonic()
             batch = []      # a failure rollback does this with writes paused: one round trip per key adds up
             async for k in c.scan_iter(match=prefix + "*", count=1000):
                 batch.append(k)
@@ -1020,6 +1075,8 @@ async def _drop_prefix(ep: Endpoint, prefix: str) -> int:
                     batch.clear()
             if batch:
                 n += await c.unlink(*batch)
+            steps[f"drop_db{db}"] = round((time.monotonic() - t) * 1000, 1)
         finally:
-            await c.aclose()
+            if owned:
+                await c.aclose()
     return n
