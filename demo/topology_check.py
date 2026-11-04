@@ -20,7 +20,10 @@ IMAGE = "valkey/valkey:8"
 NODES = {"plain-a": (16391, []), "plain-b": (16392, []), "cluster": (16393, ["--cluster-enabled", "yes"]),
          "two-dbs": (16394, ["--databases", "2"]),
          "evicting": (16395, ["--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]),
-         "lru-no-limit": (16396, ["--maxmemory-policy", "allkeys-lru"])}
+         "lru-no-limit": (16396, ["--maxmemory-policy", "allkeys-lru"]),
+         # managed-like: CONFIG refused, so the precheck cannot turn the missing expired events on
+         "no-expired": (16397, ["--notify-keyspace-events", "Kg$", "--rename-command", "CONFIG", ""]),
+         "no-expired-config": (16398, ["--notify-keyspace-events", "Kg$"])}
 results: list[bool] = []
 
 
@@ -65,7 +68,7 @@ async def wait_up():
 async def topology_errors(src: str, dst: str) -> list[str]:
     m = Migration(None, None, None, ep(src), ep(dst), "default")
     r = await m.precheck()
-    return [e for e in r["errors"] if "cluster mode" in e or " db " in e or "outside db 0" in e or "evict" in e]
+    return [e for e in r["errors"] if "cluster mode" in e or " db " in e or "outside db 0" in e or "evict" in e or "notifications" in e]
 
 
 async def put(name: str, db: int, *cmd):
@@ -93,6 +96,12 @@ async def main():
         report("원본이 축출 정책 → 거부 (역방향 동기화 때 대상이 됨)", len(errs) == 1 and "on source" in errs[0], errs)
         errs = await topology_errors("plain-a", "lru-no-limit")
         report("maxmemory 없음 → 축출 정책이 있어도 거부 안 함", errs == [], errs)
+
+        errs = await topology_errors("plain-a", "no-expired")
+        report("만료 알림이 안 오고 CONFIG도 막힌 대상 → 거부", len(errs) == 1 and "expired-key notifications" in errs[0]
+               and "on target" in errs[0], errs)
+        errs = await topology_errors("plain-a", "no-expired-config")
+        report("만료 알림이 꺼져 있어도 CONFIG가 열려 있으면 켜고 통과", errs == [], errs)
 
         await put("plain-a", 5, "SET", "session:in-db5", "1")
         errs = await topology_errors("plain-a", "plain-b")

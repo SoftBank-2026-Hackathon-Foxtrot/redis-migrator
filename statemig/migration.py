@@ -233,8 +233,8 @@ class Migration:
                     await c.config_set("notify-keyspace-events", "KA")
                 except Exception as e:  # noqa: BLE001  managed Redis: notifications are set by IaC
                     r["warnings"].append(f"CONFIG refused on {name} ({e}); expecting notifications set by IaC")
-                if not await _notifications_work(c):
-                    r["errors"].append(f"keyspace notifications do not arrive on {name}")
+                if why := await _notifications_work(c):
+                    r["errors"].append(f"{why} on {name}")
                 r["fence"][ep.name] = await _fence_mode(c, self.app_user)
                 if r["fence"][ep.name] == "isolated":
                     r["warnings"].append(f"ACL refused on {name}: only credential isolation fences it")
@@ -301,6 +301,8 @@ class Migration:
             return "no sync running"
         if s.get("halted"):
             return f"sync halted: {s['halted']}"
+        if s.get("notifications_silent"):
+            return f"keyspace notifications stopped arriving from {s['src']}"
         if self.mode == "delta" and not s["compare_valid"]:
             return "full compare not finished"
         if s["stable_ms"] < READY_STABLE_MS:
@@ -626,7 +628,8 @@ class Migration:
                 # The backlog is all that is missing only if every change was seen: not while a
                 # rescan after a dropped subscription is running, nor when the target still took
                 # writes while the subscription was down (a target that died drops it, harmlessly).
-                res["reverse_backlog_is_minimum"] = bool(st.get("rescanning") or st.get("written_while_unsubscribed"))
+                res["reverse_backlog_is_minimum"] = bool(st.get("rescanning") or st.get("written_while_unsubscribed")
+                                                         or st.get("notifications_silent"))
                 res["reverse_subscription_down_ms"] = st.get("subscription_down_ms")
         except Exception as e:  # noqa: BLE001
             res["reverse_backlog_at_failure"] = f"unknown: {_why(e)}"
@@ -920,23 +923,37 @@ async def _restart_risks(c) -> list[str]:
     return risks
 
 
-async def _notifications_work(c) -> bool:
-    """A real probe: a write to a throwaway key must produce a keyspace event."""
+async def _notifications_work(c) -> str | None:
+    """Real probes, since CONFIG is refused on managed Redis: a write must produce a keyspace event,
+    and so must an expiry (an expired key that sent nothing would stay on the other side). Returns
+    what is missing, or None."""
     p = c.pubsub()
-    channel = b"__keyspace@0__:" + PROBE_KEY
+    written, expiring = PROBE_KEY, PROBE_KEY + b":ttl"
     try:
-        await p.psubscribe(channel)
+        await p.psubscribe(b"__keyspace@0__:" + PROBE_KEY + b"*")
         await p.get_message(timeout=1)      # the subscribe confirmation
-        await c.set(PROBE_KEY, b"1", px=2000)
-        end = time.monotonic() + 2
-        while time.monotonic() < end:
-            if await p.get_message(ignore_subscribe_messages=True, timeout=0.2):
-                return True
-        return False
-    except Exception:  # noqa: BLE001
-        return False
+        seen = set()
+
+        async def wait_for(event: bytes) -> bool:
+            end = time.monotonic() + 2
+            while time.monotonic() < end and event not in seen:
+                m = await p.get_message(ignore_subscribe_messages=True, timeout=0.2)
+                if m:
+                    seen.add(m["data"] if isinstance(m["data"], bytes) else str(m["data"]).encode())
+            return event in seen
+        await c.set(written, b"1", px=2000)
+        if not await wait_for(b"set"):
+            return "keyspace notifications do not arrive"
+        await c.set(expiring, b"1", px=50)
+        await asyncio.sleep(0.1)
+        await c.exists(expiring)            # expires it now if the active cycle has not yet
+        if not await wait_for(b"expired"):
+            return "expired-key notifications do not arrive (notify-keyspace-events needs K and A, or Kx with the types)"
+        return None
+    except Exception as e:  # noqa: BLE001
+        return f"keyspace notifications could not be checked ({_why(e)})"
     finally:
-        await c.delete(PROBE_KEY)
+        await c.delete(written, expiring)
         await p.aclose()
 
 

@@ -6,7 +6,9 @@ After a cutover the reverse sync copies the target's changes back. When the targ
 rollback reports that backlog. It is exact only if every change was seen: this kills the target
 once with the reverse subscription up (exact), and once after the target kept taking writes while
 the subscription was refused (reported as a minimum). In between, the flag must clear again once
-the subscription is back and the rescan has run.
+the subscription is back and the rescan has run. Last, notifications turned off on a live
+subscription: during the sync (noticed, put back, nothing lost), and on the target after a cutover
+where they cannot be put back (the loss report is a minimum).
 """
 import sys
 import time
@@ -63,11 +65,50 @@ def unseen_writes_case():
                                        "reverse_subscription_down_ms")})
 
 
+def silence_heals_case():
+    """Notifications turned off on the source during the sync: noticed, put back, nothing lost."""
+    w = rc.fresh()
+    rc.to_ready()
+    aws = rc.admin("aws")
+    aws.config_set("notify-keyspace-events", "")
+    t0 = time.time()
+    for i in range(50):        # written while nobody is told
+        rc.app_client().set(f"session:unseen:{i}", i)
+    noticed = rc.maybe(lambda: rc.until(lambda: sync_status().get("notification_silences", 0) >= 1, 15, "noticed"), False)
+    healed = rc.maybe(lambda: rc.until(lambda: rc.status().get("ready"), 60, "ready again"), False)
+    gcp = rc.admin("gcp")
+    copied = sum(1 for i in range(50) if gcp.get(f"session:unseen:{i}") is not None)
+    w.stop()
+    rc.report("동기화 중 원본 알림이 꺼짐 → 감지, 다시 켬, 그사이 쓴 키도 복사",
+              bool(noticed) and bool(healed) and copied == 50 and "K" in aws.config_get("notify-keyspace-events")[
+                  "notify-keyspace-events"],
+              f"감지·복구·ready까지 {time.time() - t0:.1f}s, 복사 {copied}/50, 알림 설정 "
+              f"{aws.config_get('notify-keyspace-events')['notify-keyspace-events']!r}")
+
+
+def silence_then_failure_case():
+    """After a cutover the target's notifications go off for good, then the target dies."""
+    w = rc.fresh()
+    rc.to_executed()
+    gcp = rc.admin("gcp")
+    gcp.config_set("notify-keyspace-events", "")
+    gcp.execute_command("ACL", "SETUSER", "default", "-config")    # the Sync Worker cannot put them back
+    silent = rc.maybe(lambda: rc.until(lambda: sync_status().get("notifications_silent"), 15, "silent"), False)
+    time.sleep(1)   # the writer keeps writing to gcp, none of it notified
+    res = failure_rollback()
+    w.stop()
+    rc.report("역방향 알림이 꺼진 채 대상이 죽음 → 유실 보고는 최소값", bool(silent)
+              and res.get("reverse_backlog_is_minimum") is True,
+              {k: res.get(k) for k in ("reverse_backlog_at_failure", "reverse_backlog_is_minimum")})
+
+
 def main():
     print("fresh stack...", flush=True)
     rc.compose("up", "-d", "--build", *rc.SERVICES)
     rc.safe(exact_case)
     rc.safe(unseen_writes_case)
+    rc.safe(silence_heals_case)
+    rc.safe(silence_then_failure_case)
     rc.compose("down", "-v", "-t", "0", "--remove-orphans")
     print(f"\n{sum(rc.results)}/{len(rc.results)} passed")
     sys.exit(0 if all(rc.results) else 1)

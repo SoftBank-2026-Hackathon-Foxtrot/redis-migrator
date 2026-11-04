@@ -58,6 +58,7 @@ const (
 	settledBacklog = 1000 // the precompare starts once the first copy is about done
 	healthyLagMs   = 1000 // heartbeat round trip, and time to copy the backlog
 	lostBeatMs     = 5000 // a heartbeat this late is replaced by a new one
+	silentAfterMs  = 5000 // no heartbeat notification for this long on a live subscription: notifications are off
 )
 
 type shard struct {
@@ -109,6 +110,9 @@ type Syncer struct {
 	downSince         atomic.Int64 // unix ms since the subscription is down (0 = up, or never was)
 	scansRunning      atomic.Int32 // full scans in progress: until they end, the backlog is not all there is
 	writtenWhileDown  atomic.Bool  // src took a write while the subscription was down; cleared by a full rescan
+	unanswered        atomic.Int64 // unix ms of the oldest heartbeat whose notification has not come back (0 = none)
+	silent            atomic.Bool  // notifications stopped coming although the subscription is up
+	silences          atomic.Int64
 	stableSince       atomic.Int64 // unix ms since the sync has kept up (0 = it has not)
 	copyRate          atomic.Int64 // keys per second
 }
@@ -503,6 +507,7 @@ func (s *Syncer) subscriber(src *redisx.Endpoint, epoch uint64, confirmed chan s
 		s.mu.Unlock()
 		s.subscribed.Store(true)
 		s.downSince.Store(0)
+		s.unanswered.Store(0) // a heartbeat sent before the reconnect may never come back
 		if first {
 			first = false
 			close(confirmed)
@@ -511,7 +516,7 @@ func (s *Syncer) subscriber(src *redisx.Endpoint, epoch uint64, confirmed chan s
 			s.resyncs.Add(1)
 			log.Printf("resubscribed to %s: full two-sided rescan", src.Name)
 			go func() {
-				if _, err := s.FullScan(); err == nil {
+				if _, err := s.FullScan(); err == nil && !s.silent.Load() {
 					s.writtenWhileDown.Store(false)
 				}
 			}()
@@ -696,6 +701,8 @@ func (s *Syncer) Reverse(newSrc string, deadline time.Time) error {
 	s.guardMu.Unlock()
 	s.beatSent.Store(0) // one in flight on the old src never comes back
 	s.beatLag.Store(0)
+	s.unanswered.Store(0)
+	s.silent.Store(false)
 	// Writes are paused and both sides were just verified: tracking restarts from equal.
 	s.startTracking()
 	if s.comparedResync.Load() >= 0 {
@@ -733,7 +740,8 @@ func (s *Syncer) Status() map[string]any {
 		"last_compare": s.lastCompare.Load(), "halted": s.haltReason(),
 		"rescanning": s.scansRunning.Load() > 0, "subscription_down_ms": s.downMs(),
 		"written_while_unsubscribed": s.writtenWhileDown.Load(),
-		"lag_ms":                     s.lagMs(), "stable_ms": s.stableMs(), "copy_rate": s.copyRate.Load(),
+		"notifications_silent":       s.silent.Load(), "notification_silences": s.silences.Load(),
+		"lag_ms": s.lagMs(), "stable_ms": s.stableMs(), "copy_rate": s.copyRate.Load(),
 		"compare_rate": s.compareRate.Load(), "est_verify_ms": s.estVerifyMs(),
 	}
 }
@@ -902,6 +910,37 @@ func (s *Syncer) beatArrived() {
 	if sent := s.beatSent.Swap(0); sent > 0 {
 		s.beatLag.Store(time.Now().UnixMilli() - sent)
 	}
+	s.unanswered.Store(0)
+	if s.silent.Swap(false) {
+		// What changed while they were off was never marked: resubscribe for a full rescan.
+		log.Printf("keyspace notifications arrive again: full two-sided rescan")
+		s.closeSub()
+	}
+}
+
+// checkSilence: a live subscription that no longer brings back the heartbeat's notification means
+// notifications were turned off on src (CONFIG SET, a parameter group, a restart that lost them).
+// Nothing is marked from then on, so it is treated like a dropped subscription: not kept, the full
+// compare is void, a loss report is a minimum, and a resubscribe rescans both sides. They are put
+// back on where CONFIG is allowed. c is the heartbeat connection to src, or nil.
+func (s *Syncer) checkSilence(c *redisx.Conn, now int64) {
+	u := s.unanswered.Load()
+	if u == 0 || now-u <= silentAfterMs || !s.subscribed.Load() || s.silent.Load() {
+		return
+	}
+	src, _, _ := s.dir()
+	s.silent.Store(true)
+	s.silences.Add(1)
+	s.writtenWhileDown.Store(true) // src took heartbeats nobody saw: app writes may have gone unseen too
+	s.comparedResync.Store(-1)
+	s.lastErr.Store("keyspace notifications stopped arriving from " + src.Name)
+	log.Printf("keyspace notifications stopped arriving from %s", src.Name)
+	if c != nil {
+		if err := restoreNotifications(c); err != nil {
+			log.Printf("could not turn notifications back on: %v", err)
+		}
+	}
+	s.closeSub()
 }
 
 func (s *Syncer) lagMs() int64 {
@@ -933,7 +972,7 @@ func (s *Syncer) kept() bool {
 	n, oldest := s.Backlog()
 	drainMs := int64(n) * 1000 / max(s.copyRate.Load(), 1000)
 	return s.subscribed.Load() && !s.scanning.Load() && s.haltReason() == "" && s.lagMs() <= healthyLagMs &&
-		drainMs <= healthyLagMs && oldest <= healthyLagMs
+		drainMs <= healthyLagMs && oldest <= healthyLagMs && !s.silent.Load()
 }
 
 // monitor sends heartbeats, keeps the rates and starts the rolling compare.
@@ -956,6 +995,7 @@ func (s *Syncer) monitor() {
 			lastDone, lastRate = done, now
 		}
 		c, epoch = s.beat(c, epoch)
+		s.checkSilence(c, now.UnixMilli())
 		if s.kept() {
 			s.stableSince.CompareAndSwap(0, now.UnixMilli())
 		} else {
@@ -1005,6 +1045,7 @@ func (s *Syncer) beat(c *redisx.Conn, epoch uint64) (*redisx.Conn, uint64) {
 		c.Close()
 		return nil, cur
 	}
+	s.unanswered.CompareAndSwap(0, now)
 	return c, cur
 }
 
