@@ -31,6 +31,7 @@ const (
 	maxBuckets     = 1 << 18
 	keysPerBucket  = 16   // a differing bucket costs listing about this many keys
 	expiryTolMs    = 2000 // as the verify
+	calibrateKeys  = 1000 // compared value by value, to time the compare
 	bucketModeSum  = "sum"
 	bucketModeList = "list"
 )
@@ -353,12 +354,49 @@ func (s *Syncer) bucketCompare(deadline time.Time) (map[string]any, error) {
 			}
 		}
 	}
-	res := map[string]any{"method": "buckets", "buckets": n, "buckets_differed": differing,
+	rate, err := s.calibrate(dbs, deadline)
+	if err != nil {
+		return nil, err
+	}
+	res := map[string]any{"method": "buckets", "compare_rate": rate, "buckets": n, "buckets_differed": differing,
 		"keys_listed": listed, "differed": marked, "hash_ms": t1.Sub(t0).Milliseconds(),
 		"ms": float64(time.Since(t0).Microseconds()) / 1000}
 	log.Printf("bucket compare: %d buckets, %d differed, %d keys listed, %d marked, %v", n, differing, listed,
 		marked, time.Since(t0).Round(time.Millisecond))
 	return res, nil
+}
+
+// calibrate compares a sample value by value, for the compare rate: the estimate of the verify
+// inside the pause, which refuses a cutover that cannot fit its budget, comes from it. A key that
+// differs is marked.
+func (s *Syncer) calibrate(dbs []int, deadline time.Time) (int64, error) {
+	srcEP, _, _ := s.dir()
+	var sample []string
+	for _, p := range s.include {
+		if len(sample) >= calibrateKeys {
+			break
+		}
+		ks, err := sampleKeys(srcEP, dbs, p, calibrateKeys-len(sample))
+		if err != nil {
+			return 0, err
+		}
+		sample = append(sample, ks...)
+	}
+	if len(sample) < verifyBatch { // too few to time: the rolling compare will
+		return s.compareRate.Load(), nil
+	}
+	t0 := time.Now()
+	cmp := s.newComparer(deadline)
+	cmp.SubmitAll(sample, nil)
+	bad, n, err := cmp.Wait()
+	if err != nil {
+		return 0, err
+	}
+	for _, k := range bad {
+		s.Mark(k)
+	}
+	s.storeCompareRate(n, time.Since(t0))
+	return s.compareRate.Load(), nil
 }
 
 // dbKeys sums the keys of every db (INFO keyspace), to size the buckets.
