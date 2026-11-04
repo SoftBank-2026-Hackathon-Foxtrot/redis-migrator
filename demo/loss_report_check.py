@@ -86,6 +86,34 @@ def silence_heals_case():
               f"{aws.config_get('notify-keyspace-events')['notify-keyspace-events']!r}")
 
 
+def silence_retry_case():
+    """The first try to turn notifications back on fails (CONFIG refused at that moment): they are
+    tried again until they come back, not given up after one try."""
+    w = rc.fresh()
+    rc.to_ready()
+    aws = rc.admin("aws")
+    aws.execute_command("ACL", "SETUSER", "default", "-config")
+    aws.execute_command("ACL", "SETUSER", "admin-tmp", "on", ">tmppw", "~*", "&*", "+@all")
+    tmp = rc.redis.Redis(host="localhost", port=rc.PORT["aws"], username="admin-tmp", password="tmppw",
+                         decode_responses=True)
+    tmp.config_set("notify-keyspace-events", "")
+    for i in range(50):
+        rc.app_client().set(f"session:unseen2:{i}", i)
+    noticed = rc.maybe(lambda: rc.until(lambda: sync_status().get("notification_silences", 0) >= 1, 15, "noticed"), False)
+    time.sleep(2)             # the first try has failed by now
+    tmp.execute_command("ACL", "SETUSER", "default", "+config")
+    t0 = time.time()
+    healed = rc.maybe(lambda: rc.until(lambda: rc.status().get("ready"), 60, "ready again"), False)
+    gcp = rc.admin("gcp")
+    copied = sum(1 for i in range(50) if gcp.get(f"session:unseen2:{i}") is not None)
+    conf = tmp.config_get("notify-keyspace-events")["notify-keyspace-events"]
+    tmp.execute_command("ACL", "DELUSER", "admin-tmp")
+    w.stop()
+    rc.report("알림 다시 켜기가 처음엔 막혀도 재시도로 복구, 그사이 쓴 키도 복사",
+              bool(noticed) and bool(healed) and copied == 50 and "K" in conf,
+              f"허용 후 ready까지 {time.time() - t0:.1f}s, 복사 {copied}/50, 알림 설정 {conf!r}")
+
+
 def silence_then_failure_case():
     """After a cutover the target's notifications go off for good, then the target dies."""
     w = rc.fresh()
@@ -108,6 +136,7 @@ def main():
     rc.safe(exact_case)
     rc.safe(unseen_writes_case)
     rc.safe(silence_heals_case)
+    rc.safe(silence_retry_case)
     rc.safe(silence_then_failure_case)
     rc.compose("down", "-v", "-t", "0", "--remove-orphans")
     print(f"\n{sum(rc.results)}/{len(rc.results)} passed")

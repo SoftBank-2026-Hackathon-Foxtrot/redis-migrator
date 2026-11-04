@@ -116,6 +116,7 @@ type Syncer struct {
 	unanswered        atomic.Int64 // unix ms of the oldest heartbeat whose notification has not come back (0 = none)
 	silent            atomic.Bool  // notifications stopped coming although the subscription is up
 	silences          atomic.Int64
+	restoreTried      atomic.Int64 // unix ms of the last try to turn notifications back on
 	stableSince       atomic.Int64 // unix ms since the sync has kept up (0 = it has not)
 	copyRate          atomic.Int64 // keys per second
 }
@@ -927,8 +928,19 @@ func (s *Syncer) beatArrived() {
 // compare is void, a loss report is a minimum, and a resubscribe rescans both sides. They are put
 // back on where CONFIG is allowed. c is the heartbeat connection to src, or nil.
 func (s *Syncer) checkSilence(c *redisx.Conn, now int64) {
+	if s.silent.Load() {
+		// Turned back on once is not enough: that try can fail, or find no connection. Until a
+		// heartbeat's notification comes back, try again every second.
+		if c != nil && now-s.restoreTried.Load() >= 1000 {
+			s.restoreTried.Store(now)
+			if err := restoreNotifications(c); err != nil {
+				s.lastErr.Store("could not turn notifications back on: " + err.Error())
+			}
+		}
+		return
+	}
 	u := s.unanswered.Load()
-	if u == 0 || now-u <= silentAfterMs || !s.subscribed.Load() || s.silent.Load() {
+	if u == 0 || now-u <= silentAfterMs || !s.subscribed.Load() {
 		return
 	}
 	src, _, _ := s.dir()
@@ -939,6 +951,7 @@ func (s *Syncer) checkSilence(c *redisx.Conn, now int64) {
 	s.lastErr.Store("keyspace notifications stopped arriving from " + src.Name)
 	log.Printf("keyspace notifications stopped arriving from %s", src.Name)
 	if c != nil {
+		s.restoreTried.Store(now)
 		if err := restoreNotifications(c); err != nil {
 			log.Printf("could not turn notifications back on: %v", err)
 		}
