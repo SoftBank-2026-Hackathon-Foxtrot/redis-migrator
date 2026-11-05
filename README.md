@@ -1,3 +1,10 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.png">
+  <img alt="Redis Migrator 구조도와 컷오버 순서" src="docs/architecture.png">
+</picture>
+
+[구조도 HTML 원본](docs/architecture.html)
+
 # redis-migrator
 
 Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 주소만 알고, 전환할 때 쓰기를 잠깐 멈춘 뒤 프록시가 대상 Redis를 바꾼다.
