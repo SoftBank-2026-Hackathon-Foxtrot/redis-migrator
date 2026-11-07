@@ -30,10 +30,11 @@ type server struct {
 func main() {
 	redisx.ClientName = "statemig-admin"
 	spec := os.Getenv("STATEMIG_ENDPOINTS")
-	if spec == "" {
-		spec = "local=redis://localhost:6379"
+	eps := map[string]*redisx.Endpoint{}
+	var err error
+	if spec != "" {
+		eps, _, err = redisx.ParseEndpoints(spec)
 	}
-	eps, _, err := redisx.ParseEndpoints(spec)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -44,6 +45,7 @@ func main() {
 	s := &server{endpoints: eps}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", s.status)
+	mux.HandleFunc("POST /backends", s.registerBackend)
 	mux.HandleFunc("POST /start", s.start)
 	mux.HandleFunc("POST /precompare", s.precompare)
 	mux.HandleFunc("POST /reconcile", s.reconcile)
@@ -104,7 +106,9 @@ func (s *server) start(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
+	s.mu.Lock()
 	src, dst := s.endpoints[req.Src], s.endpoints[req.Dst]
+	s.mu.Unlock()
 	if src == nil || dst == nil || src == dst || len(req.Include) == 0 {
 		fail(w, 400, fmt.Errorf("need distinct known src/dst and at least one include prefix"))
 		return
@@ -257,4 +261,34 @@ func (s *server) stop(w http.ResponseWriter, _ *http.Request) {
 	st := sy.Status()
 	sy.Stop()
 	writeJSON(w, 200, map[string]any{"stopped": st})
+}
+
+// Credentials are resolved by the API and kept only in this process's memory.
+func (s *server) registerBackend(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req) != nil || req.Name == "" {
+		fail(w, 400, fmt.Errorf("name and Redis connection required"))
+		return
+	}
+	ep, err := redisx.ParseEndpoint(req.Name, req.URL)
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old := s.endpoints[req.Name]
+	if old != nil && old.Same(ep) {
+		writeJSON(w, 200, old)
+		return
+	}
+	if old != nil && s.sy != nil {
+		fail(w, 409, fmt.Errorf("cannot replace a backend while syncing"))
+		return
+	}
+	s.endpoints[req.Name] = ep
+	writeJSON(w, 201, ep)
 }

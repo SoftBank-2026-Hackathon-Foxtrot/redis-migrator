@@ -142,13 +142,18 @@ func (p *Proxy) Serve(ln net.Listener) error {
 		if err != nil {
 			return err
 		}
-		s := &session{p: p, nc: nc, cr: bufio.NewReaderSize(nc, 64<<10), cw: bufio.NewWriterSize(nc, 64<<10),
-			authed: len(p.clients) == 0, ups: map[string]*redisx.Conn{}}
-		p.mu.Lock()
-		p.sessions[s] = struct{}{}
-		p.mu.Unlock()
-		go s.run()
+		p.ServeConn(nc)
 	}
+}
+
+// ServeConn attaches a connection to the fixed proxy after its initial binding.
+func (p *Proxy) ServeConn(nc net.Conn) {
+	s := &session{p: p, nc: nc, cr: bufio.NewReaderSize(nc, 64<<10), cw: bufio.NewWriterSize(nc, 64<<10),
+		authed: len(p.clients) == 0, ups: map[string]*redisx.Conn{}}
+	p.mu.Lock()
+	p.sessions[s] = struct{}{}
+	p.mu.Unlock()
+	go s.run()
 }
 
 func (p *Proxy) Route() (Route, bool) {

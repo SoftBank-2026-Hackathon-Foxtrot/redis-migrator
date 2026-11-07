@@ -111,7 +111,7 @@ class MigrationStore(ControlRecord):
 class Migration:
     def __init__(self, proxy: Admin, sync: Admin, record: ControlRecord, source: Endpoint, target: Endpoint,
                  app_user: str, store: MigrationStore | None = None, mode: str = "delta",
-                 direct_user: str | None = None):
+                 direct_user: str | None = None, persistent_proxy: bool = False):
         self.proxy, self.sync, self.record, self.store = proxy, sync, record, store
         self.source, self.target = source, target
         self.app_user = app_user
@@ -119,6 +119,7 @@ class Migration:
         # It is shut on the source once every application goes through the proxy, and opened on
         # the side that stays active when the migration ends.
         self.direct_user = direct_user
+        self.persistent_proxy = persistent_proxy
         self.direct_fence: dict[str, str] = {}   # endpoint → "acl" | "manual" | "open"
         self.mode = mode           # "full": compare everything inside the pause; "delta": before it
         self.compare_task: asyncio.Task | None = None
@@ -939,6 +940,8 @@ class Migration:
 
     async def _open_direct_on_active(self):
         """The migration ended: applications go back to a direct connection on the side that stays."""
+        if self.persistent_proxy:
+            return
         rec = self.record.read() or {}
         eps = {self.source.name: self.source, self.target.name: self.target}
         if (active := eps.get(rec.get("active"))) is not None:
