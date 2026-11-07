@@ -10,6 +10,8 @@ Config (env):
                          (optional). Shut on the source once every application goes through the
                          proxy, opened on the side that stays when the migration ends
   STATEMIG_ADMIN_TOKEN   bearer token for this API, the proxy's and the Sync Worker's
+  STATEMIG_PERSISTENT_PROXY  1/true: the proxy stays in front of Redis for good, even without a
+                         registered binding (applications only ever hold the proxy address)
 """
 import asyncio
 import hmac
@@ -26,7 +28,7 @@ from pydantic import BaseModel, Field
 from .backend import Endpoint
 from .bindings import Bindings
 from .common import CommonApi, build_router
-from .migration import Admin, ControlRecord, Migration, MigrationError, MigrationStore
+from .migration import Admin, ControlRecord, Migration, MigrationError, MigrationStore, persistent_proxy_env
 from .telemetry import TraceMiddleware, get_telemetry, publish_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -48,6 +50,12 @@ if DIRECT_USER == APP_USER:
 current: Migration | None = None
 history: list[dict] = []
 bindings = Bindings(str(record.path.with_name("bindings.json")), proxy, sync, record, ENDPOINTS)
+PERSISTENT_PROXY = persistent_proxy_env(os.environ.get("STATEMIG_PERSISTENT_PROXY"))
+
+
+def _persistent() -> bool:
+    """A registered binding, or the platform's word that the proxy is always in front."""
+    return PERSISTENT_PROXY or bool(bindings.data["binding"])
 
 
 def require_token(authorization: str = Header("")):
@@ -82,7 +90,7 @@ async def recover_saved_migration():
         if not terminal and current is None:
             current = Migration.load(proxy, sync, record, store, ENDPOINTS, APP_USER, DIRECT_USER)
             if current:
-                current.persistent_proxy = bool(bindings.data["binding"])
+                current.persistent_proxy = _persistent()
     except Exception:
         logging.getLogger("statemig.api").error("binding recovery is not confirmed; new migrations remain blocked")
     if current:
@@ -198,7 +206,7 @@ async def _new_migration(req: StartReq) -> Migration:
         history.append(current.status())
         current.retire()
     current = Migration(proxy, sync, record, ENDPOINTS[px["active"]], ENDPOINTS[req.target], APP_USER, store, req.mode,
-                        DIRECT_USER, persistent_proxy=bool(bindings.data["binding"]))
+                        DIRECT_USER, persistent_proxy=_persistent())
     return current
 
 

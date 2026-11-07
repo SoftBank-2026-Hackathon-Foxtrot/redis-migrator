@@ -1071,6 +1071,11 @@ async def _notifications_work(c) -> str | None:
         await p.aclose()
 
 
+def persistent_proxy_env(value: str | None) -> bool:
+    """STATEMIG_PERSISTENT_PROXY: the platform keeps the proxy in front of Redis for good."""
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _direct_findings(direct: list[str] | None, persistent_proxy: bool) -> tuple[list[str], list[str]]:
     """Errors and warnings for the direct-connection check.
     Memorystore refuses CLIENT LIST, so it cannot show who is connected. With a persistent proxy
