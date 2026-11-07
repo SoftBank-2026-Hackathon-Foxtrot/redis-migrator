@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -848,13 +849,25 @@ class Migration:
         try:
             st = await self.sync.call("GET", "/status", timeout=1)
             not_ready = await self.not_ready() if self.state == "SYNCING" else None
-        except Exception as e:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             return {"running": False, "halted": None, "backlog": None, "lag_ms": None, "changed_keys": None,
-                    "error": f"unreachable: {_why(e)}", "not_ready": "Sync Worker unreachable"}
+                    "error": "SYNC_WORKER_UNREACHABLE", "not_ready": "Sync Worker unreachable", "observedAt": None}
         s = st.get("sync") or {}
-        return {"running": bool(st.get("running")), "halted": s.get("halted") or None, "backlog": s.get("backlog"),
-                "lag_ms": s.get("lag_ms"), "changed_keys": s.get("delta_keys"), "error": self.sync_error,
-                "not_ready": not_ready}
+        comparison = s.get("last_compare") or {}
+        return {"running": bool(st.get("running")), "halted": bool(s.get("halted")), "backlog": s.get("backlog"),
+                "lag_ms": s.get("lag_ms"), "changed_keys": s.get("delta_keys"),
+                "error": "SYNC_ERROR" if self.sync_error else None, "not_ready": not_ready,
+                "observedAt": datetime.now(timezone.utc).isoformat(),
+                "direction": "FORWARD" if s.get("src") == self.source.name else
+                             "REVERSE" if s.get("src") == self.target.name else "UNKNOWN",
+                "copied": s.get("copied"), "oldestDirtyAgeMs": s.get("oldest_dirty_age_ms"),
+                "epoch": s.get("epoch"),
+                "verification": {"method": comparison.get("method"), "scope": "SYNC_PREFIXES",
+                    "valid": bool(s.get("compare_valid")), "observedAt": comparison.get("observed_at"),
+                    "checkedCount": comparison.get("compared"),
+                    "mismatchCount": comparison.get("differed"),
+                    "comparedBuckets": comparison.get("buckets"),
+                    "mismatchedBuckets": comparison.get("buckets_differed")}}
 
     async def _recover_forward(self, sw: dict, rec: dict):
         eps = {self.source.name: self.source, self.target.name: self.target}

@@ -233,6 +233,7 @@ class CommonApi:
 
     async def _execute(self, mig: dict, op: dict, req: ActionReq):
         op["status"] = "RUNNING"
+        op["startedAt"] = _now()
         self.store.save(self.data)
         before = await self._observe(mig)
         try:
@@ -246,6 +247,7 @@ class CommonApi:
             log.exception("%s", req.action)
             op["status"], op["error"] = "UNKNOWN", self._op_error(op, "UNKNOWN_STATE", _why(e))
             mig["unknownOperationId"] = op["operationId"]
+        op["finishedAt"] = _now()
         op["confirmedChanges"] = _changes(req.action, op, before, await self._observe(mig))
         mig["activeOperationId"] = None
         mig["revision"] += 1
@@ -427,6 +429,12 @@ class CommonApi:
             mig["isReady"] = core.state == "SYNCING" and not why_not_ready
         lifecycle = self._lifecycle(mig)
         details = self._details(mig, observed, core)
+        details["sync"] = sync_view
+        px = observed.get("proxy") or {}
+        details["proxy"] = {key: px.get(key) for key in (
+            "gen", "paused", "inflight_writes", "open_tx", "last_pause_ms",
+            "pubsub_sessions", "pubsub_moved", "pubsub_cut", "pubsub_dropped")}
+        details["proxy"]["observedAt"] = observed["observedAt"] if px else None
         route, paused = observed["route"], (observed.get("proxy") or {}).get("paused")
 
         if lifecycle in ("READY", "QUIESCED"):
