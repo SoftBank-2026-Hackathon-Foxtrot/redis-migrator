@@ -28,7 +28,7 @@ Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 �
 - Pub/Sub 구독(`SUBSCRIBE`, `PSUBSCRIBE`)은 전환해도 연결이 유지된다. 정상 전환과 정상 롤백에서는 메시지 유실·중복이 없다. `MONITOR`와 `SSUBSCRIBE`는 끊는다
 - 여러 db는 번호 그대로 옮긴다
 - 사전 점검에서 거부: Cluster 모드, 반대쪽에 없는 db 번호, db 0 밖의 큐, `maxmemory`가 있는데 `noeviction`이 아닌 경우, 원본에 앱의 직접 연결이 남은 경우
-- 평소 앱이 Redis에 직접 붙는 구성(설계 3-8): 오케스트레이터가 앱을 프록시로 옮긴 뒤 PREPARE를 보낸다. 사전 점검은 원본 `CLIENT LIST`에서 이름이 `direct:`로 시작하는 연결과, 이름 없이 `STATEMIG_DIRECT_USER`로 붙은 연결을 센다. 프록시는 `statemig-proxy`, Sync Worker와 statemig는 `statemig-admin`으로 이름을 붙인다. 통과하면 원본의 직접 연결 계정을 끄고, 이전이 끝나면(확정, 취소, 복귀 후 FINALIZE) 남은 쪽의 계정을 켠다. ACL이 막힌 관리형 Redis에서는 상태에 `direct_fence: manual`로 표시하고, 계정 교체는 제공자 쪽에서 한다
+- 평소 앱이 Redis에 직접 붙는 구성(설계 3-8): 오케스트레이터가 앱을 프록시로 옮긴 뒤 PREPARE를 보낸다. 사전 점검은 원본 `CLIENT LIST`에서 이름이 `direct:`로 시작하는 연결과, 이름 없이 `STATEMIG_DIRECT_USER`로 붙은 연결을 센다. 프록시는 `statemig-proxy`, Sync Worker와 statemig는 `statemig-admin`으로 이름을 붙인다. 통과하면 원본의 직접 연결 계정을 끄고, 이전이 끝나면(확정, 취소, 복귀 후 FINALIZE) 남은 쪽의 계정을 켠다. ACL이 막힌 관리형 Redis에서는 상태에 `direct_fence: manual`로 표시하고, 계정 교체는 제공자 쪽에서 한다. `CLIENT LIST`까지 막힌 Memorystore가 원본이면, 고정 프록시(바인딩)로 운영할 때는 앱이 프록시 주소만 받으므로 경고로 넘어가고, 고정 프록시가 아니면 직접 연결이 없다는 걸 증명할 수 없어 거부한다
 
 관리형 Redis는 CONFIG가 막혀 있으므로 keyspace 알림(`KEA`)과 `maxmemory-policy noeviction`을 파라미터 그룹이나 인스턴스 설정으로 켜 둬야 한다. ACL도 막혀 있어서 원본 쓰기 차단은 자격 증명 분리로만 동작한다.
 
