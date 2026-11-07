@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -17,6 +18,26 @@ type CmdTable map[string]bool // command name → has the "write" flag
 type keySpec struct{ first, last, step int }
 
 type KeyTable map[string]keySpec
+
+// An explicit application command contract can omit provider-specific extensions.
+// Every configured command must still exist on every backend with identical metadata.
+func constrainCommands(ct CmdTable, kt KeyTable, allowed map[string]bool) (CmdTable, KeyTable, error) {
+	if allowed == nil {
+		return ct, kt, nil
+	}
+	commands, keys := CmdTable{}, KeyTable{}
+	for command := range allowed {
+		held, ok := ct[command]
+		if !ok {
+			return nil, nil, fmt.Errorf("configured command unavailable: %s", command)
+		}
+		commands[command] = held
+		if spec, ok := kt[command]; ok {
+			keys[command] = spec
+		}
+	}
+	return commands, keys, nil
+}
 
 func (k KeyTable) keysOf(name string, args [][]byte) [][]byte {
 	sp, ok := k[name]

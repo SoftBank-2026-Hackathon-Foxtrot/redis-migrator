@@ -229,10 +229,9 @@ class Migration:
             # reach no subscriber. The orchestrator moves them first (design 3-8).
             direct = await _direct_clients(src, self.direct_user)
             r["direct_clients"] = direct
-            if direct is None:
-                r["errors"].append("CLIENT LIST refused on source: cannot prove no application is connected directly")
-            elif direct:
-                r["errors"].append(f"{len(direct)} direct connections on source: {direct[:5]}")
+            errors, warnings = _direct_findings(direct, self.persistent_proxy)
+            r["errors"] += errors
+            r["warnings"] += warnings
             if r["errors"]:
                 return r
             si, ti = await src.info(), await dst.info()
@@ -1070,6 +1069,20 @@ async def _notifications_work(c) -> str | None:
     finally:
         await c.delete(written, expiring)
         await p.aclose()
+
+
+def _direct_findings(direct: list[str] | None, persistent_proxy: bool) -> tuple[list[str], list[str]]:
+    """Errors and warnings for the direct-connection check.
+    Memorystore refuses CLIENT LIST, so it cannot show who is connected. With a persistent proxy
+    the applications only ever get the proxy address and never the Redis one, so a refusal there
+    is a warning; without one, nothing else proves the applications moved, so it stays an error."""
+    if direct is None:
+        if persistent_proxy:
+            return [], ["CLIENT LIST refused on source: applications only hold the persistent proxy address"]
+        return ["CLIENT LIST refused on source: cannot prove no application is connected directly"], []
+    if direct:
+        return [f"{len(direct)} direct connections on source: {direct[:5]}"], []
+    return [], []
 
 
 async def _direct_clients(c, direct_user: str | None) -> list[str] | None:

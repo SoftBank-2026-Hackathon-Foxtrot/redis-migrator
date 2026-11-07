@@ -13,6 +13,8 @@ package main
 //   STATEMIG_CLIENTS        accounts clients AUTH with: app:pw:app,worker:pw:worker
 //                           (user:password:role); empty means no auth and no role limits
 //   STATEMIG_ADMIN_TOKEN    bearer token required on the admin API
+//   STATEMIG_ALLOWED_COMMANDS optional comma-separated application command contract;
+//                            omitted commands are rejected, provider extras are ignored
 //
 // The control plane writes the record first and then calls the admin API; the
 // proxy only accepts a switch to the generation that is in the record. On
@@ -255,6 +257,12 @@ func (s *server) registerBackend(w http.ResponseWriter, r *http.Request) {
 			fail(w, fmt.Errorf("%w: backend command table unavailable", ErrState))
 			return
 		}
+		// With a contract only its commands are compared: another engine or version (Valkey,
+		// Memorystore, ElastiCache) has extra or missing commands the application never sends.
+		if ct, kt, e = constrainCommands(ct, kt, s.proxy.allowedCommands); e != nil {
+			fail(w, fmt.Errorf("%w: %v", ErrState, e))
+			return
+		}
 		if len(ct) != len(s.proxy.cmds) {
 			fail(w, fmt.Errorf("%w: incompatible backend command set", ErrState))
 			return
@@ -262,7 +270,7 @@ func (s *server) registerBackend(w http.ResponseWriter, r *http.Request) {
 		for command, held := range ct {
 			current, known := s.proxy.cmds[command]
 			if !known || current != held || s.proxy.keys[command] != kt[command] {
-				fail(w, fmt.Errorf("%w: incompatible backend command table", ErrState))
+				fail(w, fmt.Errorf("%w: incompatible backend command table: %s", ErrState, command))
 				return
 			}
 		}
