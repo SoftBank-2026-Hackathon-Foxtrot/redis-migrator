@@ -6,6 +6,9 @@ import redis.asyncio as aioredis
 from redis.backoff import NoBackoff
 from redis.retry import Retry
 
+# CLIENT LIST tells the migration's own connections from an application's direct ones by name.
+CLIENT_NAME = "statemig-admin"
+
 
 @dataclass
 class Endpoint:
@@ -39,7 +42,7 @@ class Endpoint:
             username=self.username, password=self.password,
             ssl=self.tls, ssl_cert_reqs="none" if self.tls else None,
             socket_connect_timeout=0.3, socket_timeout=10, health_check_interval=5,
-            retry=Retry(NoBackoff(), 6), decode_responses=False,
+            retry=Retry(NoBackoff(), 6), decode_responses=False, client_name=CLIENT_NAME,
         )
 
     def client(self, db: int = 0) -> aioredis.Redis:
@@ -48,5 +51,5 @@ class Endpoint:
             host=self.host, port=self.port, db=db,
             username=self.username, password=self.password,
             ssl=self.tls, ssl_cert_reqs="none" if self.tls else None,
-            socket_timeout=10, decode_responses=False,
+            socket_timeout=10, decode_responses=False, client_name=CLIENT_NAME,
         )

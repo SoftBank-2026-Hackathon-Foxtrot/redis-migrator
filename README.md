@@ -27,7 +27,8 @@ Redis를 AWS, GCP, 온프레미스 사이에서 이전한다. 앱은 프록시 �
 - 작업 큐 `q:join`, `q:notify`는 복사하지 않고, 원본을 다 소비한 뒤 소비자를 옮긴다
 - Pub/Sub 구독(`SUBSCRIBE`, `PSUBSCRIBE`)은 전환해도 연결이 유지된다. 정상 전환과 정상 롤백에서는 메시지 유실·중복이 없다. `MONITOR`와 `SSUBSCRIBE`는 끊는다
 - 여러 db는 번호 그대로 옮긴다
-- 사전 점검에서 거부: Cluster 모드, 반대쪽에 없는 db 번호, db 0 밖의 큐, `maxmemory`가 있는데 `noeviction`이 아닌 경우
+- 사전 점검에서 거부: Cluster 모드, 반대쪽에 없는 db 번호, db 0 밖의 큐, `maxmemory`가 있는데 `noeviction`이 아닌 경우, 원본에 앱의 직접 연결이 남은 경우
+- 평소 앱이 Redis에 직접 붙는 구성(설계 3-8): 오케스트레이터가 앱을 프록시로 옮긴 뒤 PREPARE를 보낸다. 사전 점검은 원본 `CLIENT LIST`에서 이름이 `direct:`로 시작하는 연결과, 이름 없이 `STATEMIG_DIRECT_USER`로 붙은 연결을 센다. 프록시는 `statemig-proxy`, Sync Worker와 statemig는 `statemig-admin`으로 이름을 붙인다. 통과하면 원본의 직접 연결 계정을 끄고, 이전이 끝나면(확정, 취소, 복귀 후 FINALIZE) 남은 쪽의 계정을 켠다. ACL이 막힌 관리형 Redis에서는 상태에 `direct_fence: manual`로 표시하고, 계정 교체는 제공자 쪽에서 한다
 
 관리형 Redis는 CONFIG가 막혀 있으므로 keyspace 알림(`KEA`)과 `maxmemory-policy noeviction`을 파라미터 그룹이나 인스턴스 설정으로 켜 둬야 한다. ACL도 막혀 있어서 원본 쓰기 차단은 자격 증명 분리로만 동작한다.
 
@@ -156,6 +157,7 @@ statemig가 태스크 교체로 이 파일을 잃으면 컷오버를 한 적이 
 | `STATEMIG_PROXY` | | | `http://redis-proxy.internal:7000` |
 | `STATEMIG_SYNCWORKER` | | | `http://redis-syncworker.internal:7100` |
 | `STATEMIG_APP_USER` | | | 앱 계정 이름 (기본 `app`). 원본 쓰기 차단에 씀 |
+| `STATEMIG_DIRECT_USER` | | | 앱이 평소 Redis에 직접 붙는 계정 (선택). `STATEMIG_APP_USER`와 달라야 함. 사전 점검의 직접 연결 판정과 원본 계정 끄기에 씀 |
 
 앱은 프록시 주소와 `STATEMIG_CLIENTS`의 계정으로 붙는다. Redis 비밀번호는 프록시만 안다.
 
@@ -200,6 +202,7 @@ cd demo && docker compose up -d --build
 | `python demo/chain_check.py` | aws → 온프레 → gcp 연속 이전 |
 | `python demo/multidb_check.py` | 여러 db의 번호 유지, 실패 큐 |
 | `python demo/topology_check.py` | 사전 점검의 거부 조건 (자체 컨테이너) |
+| `python demo/direct_check.py` | 직접 연결이 남은 원본 거부, 원본 직접 연결 계정 끄기와 남은 쪽 켜기 (자체 컨테이너) |
 | `python demo/loss_report_check.py` | 장애 롤백의 유실 범위 보고 |
 | `python demo/pubsub_check.py` | 전환 중 구독 유지, 메시지 유실·중복 |
 | `sudo python demo/syn_loss_check.py` | SYN이 유실돼도 장애 롤백의 쓰기 정지가 1초 미만 (root, iptables) |

@@ -110,10 +110,16 @@ class MigrationStore(ControlRecord):
 
 class Migration:
     def __init__(self, proxy: Admin, sync: Admin, record: ControlRecord, source: Endpoint, target: Endpoint,
-                 app_user: str, store: MigrationStore | None = None, mode: str = "delta"):
+                 app_user: str, store: MigrationStore | None = None, mode: str = "delta",
+                 direct_user: str | None = None):
         self.proxy, self.sync, self.record, self.store = proxy, sync, record, store
         self.source, self.target = source, target
         self.app_user = app_user
+        # The account applications use when they connect to Redis directly, outside a migration.
+        # It is shut on the source once every application goes through the proxy, and opened on
+        # the side that stays active when the migration ends.
+        self.direct_user = direct_user
+        self.direct_fence: dict[str, str] = {}   # endpoint → "acl" | "manual" | "open"
         self.mode = mode           # "full": compare everything inside the pause; "delta": before it
         self.compare_task: asyncio.Task | None = None
         self._state = "PRECHECK"
@@ -189,7 +195,8 @@ class Migration:
     def _save(self):
         if self.store:
             self.store.write(source=self.source.name, target=self.target.name, state=self._state, mode=self.mode,
-                             fence_mode=self.fence_mode, switching=self.switching, last_cutover=self.last_cutover,
+                             fence_mode=self.fence_mode, direct_fence=self.direct_fence,
+                             switching=self.switching, last_cutover=self.last_cutover,
                              precheck=self.precheck_report, events=self.events[-40:], ready_by=self.ready_by,
                              abort_reason=self.abort_reason)
 
@@ -199,7 +206,8 @@ class Migration:
 
     def status(self) -> dict:
         return {"source": self.source.name, "target": self.target.name, "state": self.state, "mode": self.mode,
-                "precheck": self.precheck_report, "fence_mode": self.fence_mode, "last_cutover": self.last_cutover,
+                "precheck": self.precheck_report, "fence_mode": self.fence_mode, "direct_fence": self.direct_fence,
+                "last_cutover": self.last_cutover,
                 "record": self.record.read(), "events": self.events[-40:]}
 
     # ---- start ----------------------------------------------------------------------
@@ -213,6 +221,17 @@ class Migration:
                     await c.ping()
                 except Exception as e:  # noqa: BLE001
                     r["errors"].append(f"{name} unreachable: {e}")
+            if r["errors"]:
+                return r
+            # Every application must go through the proxy before anything moves: a direct writer
+            # would keep writing to the source after the cutover, and a direct publisher would
+            # reach no subscriber. The orchestrator moves them first (design 3-8).
+            direct = await _direct_clients(src, self.direct_user)
+            r["direct_clients"] = direct
+            if direct is None:
+                r["errors"].append("CLIENT LIST refused on source: cannot prove no application is connected directly")
+            elif direct:
+                r["errors"].append(f"{len(direct)} direct connections on source: {direct[:5]}")
             if r["errors"]:
                 return r
             si, ti = await src.info(), await dst.info()
@@ -272,6 +291,9 @@ class Migration:
             if self.precheck_report["errors"]:
                 self.state = "FAILED"
                 raise MigrationError("; ".join(self.precheck_report["errors"]))
+            # Nobody connects directly any more: close the way, so a process that was missed or
+            # starts later with old settings cannot write to the source behind the proxy.
+            await self._set_direct(self.source, False)
             self._save()
             return self.precheck_report
 
@@ -605,10 +627,12 @@ class Migration:
             self.ready_by, self.abort_reason = None, reason
             self.state = "ABORTED"
             self._event("migration aborted before cutover", reason=reason)
+            await self._open_direct_on_active()
 
     async def stop_sync(self) -> None:
         async with self._lock:
             await self.sync.call("POST", "/stop")
+            await self._open_direct_on_active()
 
     async def _give_up_if_late(self):
         if self.state != "SYNCING" or not self.ready_by or time.time() < self.ready_by:
@@ -717,18 +741,20 @@ class Migration:
             await self.sync.call("POST", "/stop")
             self.state = "COMMITTED"
             self._event("committed; reverse sync stopped, old side can be decommissioned")
+            await self._open_direct_on_active()
 
     # ---- restart ----------------------------------------------------------------------
     @classmethod
     def load(cls, proxy: Admin, sync: Admin, record: ControlRecord, store: MigrationStore,
-             endpoints: dict[str, Endpoint], app_user: str) -> "Migration | None":
+             endpoints: dict[str, Endpoint], app_user: str, direct_user: str | None = None) -> "Migration | None":
         saved = store.read()
         if not saved:
             return None
         m = cls(proxy, sync, record, endpoints[saved["source"]], endpoints[saved["target"]], app_user, store,
-                saved.get("mode", "delta"))
+                saved.get("mode", "delta"), direct_user)
         m._state = saved["state"]
         m.fence_mode = saved.get("fence_mode", {})
+        m.direct_fence = saved.get("direct_fence", {})
         m.switching = saved.get("switching")
         m.last_cutover = saved.get("last_cutover")
         m.precheck_report = saved.get("precheck", {})
@@ -885,6 +911,39 @@ class Migration:
         self._after_switch(timings, sw["kind"])
 
     # ---- permissions ------------------------------------------------------------------
+    async def _set_direct(self, ep: Endpoint, enabled: bool):
+        """Opens or shuts the applications' direct account on ep. Never inside a write pause.
+        Managed Redis refuses ACL: the account is then rotated through the provider, and the
+        status says so ("manual") instead of failing the migration."""
+        if not self.direct_user:
+            return
+        c = ep.client()
+        try:
+            await c.execute_command("ACL", "SETUSER", self.direct_user, "on" if enabled else "off")
+            if not enabled:
+                await c.execute_command("CLIENT", "KILL", "USER", self.direct_user)
+            try:
+                await c.execute_command("ACL", "SAVE")
+            except ResponseError as e:
+                if "not configured" not in str(e):   # no aclfile: the precheck warned already
+                    raise
+            self.direct_fence[ep.name] = "open" if enabled else "acl"
+            self._event("direct account " + ("opened" if enabled else "shut"), endpoint=ep.name, user=self.direct_user)
+        except Exception as e:  # noqa: BLE001
+            self.direct_fence[ep.name] = "manual"
+            self._event("direct account must be " + ("opened" if enabled else "shut") + " through the provider",
+                        endpoint=ep.name, user=self.direct_user, error=_why(e))
+        finally:
+            await c.aclose()
+            self._save()
+
+    async def _open_direct_on_active(self):
+        """The migration ended: applications go back to a direct connection on the side that stays."""
+        rec = self.record.read() or {}
+        eps = {self.source.name: self.source, self.target.name: self.target}
+        if (active := eps.get(rec.get("active"))) is not None:
+            await self._set_direct(active, True)
+
     async def _set_write(self, ep: Endpoint, allowed: bool):
         """FENCE: take data writes away from the app user, keep queue consumption.
         The user's password is left alone: each Redis has its own. Runs inside a write pause, on
@@ -1008,6 +1067,26 @@ async def _notifications_work(c) -> str | None:
     finally:
         await c.delete(written, expiring)
         await p.aclose()
+
+
+async def _direct_clients(c, direct_user: str | None) -> list[str] | None:
+    """Connections of applications that bypass the proxy, or None if CLIENT LIST is refused.
+    An application names its direct connections "direct:<actor>". An unnamed connection counts too
+    when it logged in with the direct account: a process that forgot the name is still found."""
+    try:
+        clients = await c.client_list()
+    except Exception:  # noqa: BLE001
+        return None
+    found = []
+    for cl in clients:
+        name, user = _text(cl.get("name")), _text(cl.get("user"))
+        if name.startswith("direct:") or (not name and direct_user and user == direct_user):
+            found.append(f"{name or '(unnamed)'}@{_text(cl.get('addr'))}")
+    return found
+
+
+def _text(v) -> str:
+    return v.decode() if isinstance(v, bytes) else str(v or "")
 
 
 async def _fence_mode(c, app_user: str) -> str:
