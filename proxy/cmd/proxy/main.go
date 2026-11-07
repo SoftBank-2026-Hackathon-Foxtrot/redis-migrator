@@ -89,6 +89,7 @@ func (s *server) routeOf(rec *controlRecord) (Route, error) {
 }
 
 func main() {
+	redisx.ClientName = "statemig-proxy"
 	eps, order, err := redisx.ParseEndpoints(env("STATEMIG_ENDPOINTS", "local=redis://localhost:6379"))
 	if err != nil {
 		log.Fatal(err)

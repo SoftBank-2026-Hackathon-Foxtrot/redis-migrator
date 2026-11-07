@@ -28,6 +28,7 @@ type server struct {
 }
 
 func main() {
+	redisx.ClientName = "statemig-admin"
 	spec := os.Getenv("STATEMIG_ENDPOINTS")
 	if spec == "" {
 		spec = "local=redis://localhost:6379"

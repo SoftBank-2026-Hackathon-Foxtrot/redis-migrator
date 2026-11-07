@@ -6,6 +6,9 @@ Config (env):
   STATEMIG_SYNCWORKER    admin URL of the Sync Worker (default http://localhost:7100)
   STATEMIG_CONTROL_FILE  control record shared with the proxy (stand-in for the management DB)
   STATEMIG_APP_USER      ACL user the proxy uses towards Redis (fenced on the old side)
+  STATEMIG_DIRECT_USER   account applications use to reach Redis directly outside a migration
+                         (optional). Shut on the source once every application goes through the
+                         proxy, opened on the side that stays when the migration ends
   STATEMIG_ADMIN_TOKEN   bearer token for this API, the proxy's and the Sync Worker's
 """
 import asyncio
@@ -37,6 +40,9 @@ sync = Admin(os.environ.get("STATEMIG_SYNCWORKER", "http://localhost:7100"), TOK
 record = ControlRecord(os.environ.get("STATEMIG_CONTROL_FILE", "control.json"))
 store = MigrationStore(str(record.path.with_name("migration.json")))
 APP_USER = os.environ.get("STATEMIG_APP_USER", "app")
+DIRECT_USER = os.environ.get("STATEMIG_DIRECT_USER") or None
+if DIRECT_USER == APP_USER:
+    raise RuntimeError("STATEMIG_DIRECT_USER must differ from STATEMIG_APP_USER: shutting it would cut the proxy off")
 current: Migration | None = None
 history: list[dict] = []
 
@@ -62,7 +68,7 @@ async def invalid_request(request: Request, exc: RequestValidationError):
 @app.on_event("startup")
 async def recover_saved_migration():
     global current
-    current = Migration.load(proxy, sync, record, store, ENDPOINTS, APP_USER)
+    current = Migration.load(proxy, sync, record, store, ENDPOINTS, APP_USER, DIRECT_USER)
     if current:
         asyncio.create_task(current.recover())
     asyncio.create_task(_watch())
@@ -135,7 +141,8 @@ async def _new_migration(req: StartReq) -> Migration:
     if current:
         history.append(current.status())
         current.retire()
-    current = Migration(proxy, sync, record, ENDPOINTS[px["active"]], ENDPOINTS[req.target], APP_USER, store, req.mode)
+    current = Migration(proxy, sync, record, ENDPOINTS[px["active"]], ENDPOINTS[req.target], APP_USER, store, req.mode,
+                        DIRECT_USER)
     return current
 
 

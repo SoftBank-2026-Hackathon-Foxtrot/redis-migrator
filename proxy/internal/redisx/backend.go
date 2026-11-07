@@ -50,6 +50,11 @@ func ParseEndpoints(spec string) (map[string]*Endpoint, []string, error) {
 	return eps, order, nil
 }
 
+// ClientName is set with CLIENT SETNAME on every connection this process dials. It tells the
+// migration's own connections from an application's direct ones in CLIENT LIST, which is how the
+// precheck proves that every application goes through the proxy. Set it once, before dialling.
+var ClientName string
+
 // Conn is a plain synchronous RESP connection.
 type Conn struct {
 	nc net.Conn
@@ -89,15 +94,29 @@ func (e *Endpoint) dial(db int, connectTimeout time.Duration, deadline time.Time
 	}
 	nc.SetDeadline(deadline)
 	c := &Conn{nc: nc, r: bufio.NewReaderSize(nc, 64<<10), w: bufio.NewWriterSize(nc, 64<<10)}
+	// AUTH and the name go in one round trip: the proxy dials inside a write pause too.
+	var setup [][][]byte
 	if e.password != "" {
-		args := []string{"AUTH"}
+		args := [][]byte{[]byte("AUTH")}
 		if e.username != "" {
-			args = append(args, e.username)
+			args = append(args, []byte(e.username))
 		}
-		if _, err := c.DoStr(append(args, e.password)...); err != nil {
+		setup = append(setup, append(args, []byte(e.password)))
+	}
+	if ClientName != "" {
+		setup = append(setup, [][]byte{[]byte("CLIENT"), []byte("SETNAME"), []byte(ClientName)})
+	}
+	if len(setup) > 0 {
+		replies, err := c.Pipeline(setup...)
+		if err != nil {
 			c.Close()
-			return nil, fmt.Errorf("auth %s: %w", e.Name, err)
+			return nil, fmt.Errorf("connect %s: %w", e.Name, err)
 		}
+		if e.password != "" && replies[0].IsErr() {
+			c.Close()
+			return nil, fmt.Errorf("auth %s: %w", e.Name, replies[0].Err())
+		}
+		// A refused name is not fatal: it only makes this connection count as unnamed.
 	}
 	if err := c.Select(db); err != nil {
 		c.Close()
