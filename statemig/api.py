@@ -23,6 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .telemetry import TraceMiddleware, get_telemetry, publish_loop
 from .backend import Endpoint
 from .common import CommonApi, build_router
 from .migration import Admin, ControlRecord, Migration, MigrationError, MigrationStore
@@ -55,6 +56,10 @@ def require_token(authorization: str = Header("")):
 app = FastAPI(title="statemig – Redis zero-downtime migration", dependencies=[Depends(require_token)])
 
 
+telemetry = get_telemetry("redis")
+app.add_middleware(TraceMiddleware, telemetry=telemetry)
+
+
 @app.exception_handler(RequestValidationError)
 async def invalid_request(request: Request, exc: RequestValidationError):
     """The common API answers a malformed body with 400 INVALID_REQUEST in its error shape."""
@@ -71,7 +76,28 @@ async def recover_saved_migration():
     current = Migration.load(proxy, sync, record, store, ENDPOINTS, APP_USER, DIRECT_USER)
     if current:
         asyncio.create_task(current.recover())
-    asyncio.create_task(_watch())
+    app.state.watch_task = asyncio.create_task(_watch())
+    app.state.telemetry_task = asyncio.create_task(publish_loop(telemetry, collect_observations))
+
+
+async def collect_observations():
+    rows = []
+    for mid, mig in list(common.data["migrations"].items())[:256]:
+        try:
+            rows.append(("REDIS", await common.view(mid)))
+        except Exception:
+            telemetry.snapshot("REDIS", {"workflowId": mig["workflowId"], "migrationId": mid},
+                               error="OBSERVATION_UNAVAILABLE")
+    return rows
+
+
+@app.on_event("shutdown")
+async def stop_observations():
+    tasks = [app.state.watch_task, app.state.telemetry_task]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.to_thread(telemetry.close)
 
 
 async def _watch():

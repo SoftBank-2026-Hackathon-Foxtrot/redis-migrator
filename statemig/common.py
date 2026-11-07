@@ -22,6 +22,9 @@ from fastapi import APIRouter, Header, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .telemetry import get_telemetry
+from opentelemetry.trace import Status, StatusCode
+
 from .migration import ControlRecord, MigrationError, _why
 
 log = logging.getLogger("statemig.common")
@@ -232,6 +235,18 @@ class CommonApi:
         return op
 
     async def _execute(self, mig: dict, op: dict, req: ActionReq):
+        telemetry = get_telemetry("redis")
+        with telemetry.operation(req.action, workflow=mig["workflowId"],
+                                 migration=mig["migrationId"], operation=op["operationId"]) as span:
+            await self._execute_work(mig, op, req)
+            if op["status"] != "SUCCEEDED":
+                span.set_status(Status(StatusCode.ERROR, op["status"]))
+            try:
+                telemetry.snapshot("REDIS", await self.view(mig["migrationId"]))
+            except Exception:
+                log.warning("operation observation unavailable")
+
+    async def _execute_work(self, mig: dict, op: dict, req: ActionReq):
         op["status"] = "RUNNING"
         op["startedAt"] = _now()
         self.store.save(self.data)

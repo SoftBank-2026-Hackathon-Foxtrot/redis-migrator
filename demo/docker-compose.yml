@@ -51,6 +51,9 @@ services:
       STATEMIG_ENDPOINTS: *admin_eps
       STATEMIG_PROXY: http://proxy:7000
       STATEMIG_SYNCWORKER: http://syncworker:7100
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
       STATEMIG_CONTROL_FILE: /state/control.json
       STATEMIG_APP_USER: app
       STATEMIG_ADMIN_TOKEN: *admin_token
