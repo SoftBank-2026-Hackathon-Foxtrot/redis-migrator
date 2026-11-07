@@ -154,6 +154,7 @@ statemig가 태스크 교체로 이 파일을 잃으면 컷오버를 한 적이 
 | `STATEMIG_CONTROL_FILE` | `/state/control.json` | | `/state/control.json` |
 | `STATEMIG_ACTIVE` | 처음 쓸 Redis 이름 (예: `aws`). 기록이 없을 때만 씀 | | |
 | `STATEMIG_CLIENTS` [비밀] | 앱이 프록시에 AUTH할 계정. `app:<pw>:app,worker:<pw>:worker` | | |
+| `STATEMIG_ALLOWED_COMMANDS` | 앱이 쓰는 명령 목록 (선택, 쉼표 구분). 주면 목록 밖 명령은 `NOPERM`으로 거부하고, 백엔드 등록 때 이 명령들만 비교한다. 엔진이나 버전이 다른 Redis(ElastiCache, Memorystore, Valkey) 사이를 옮길 때 필요. `AUTH`, `QUIT`는 프록시가 직접 답하므로 넣지 않아도 된다 | | |
 | `STATEMIG_PROXY` | | | `http://redis-proxy.internal:7000` |
 | `STATEMIG_SYNCWORKER` | | | `http://redis-syncworker.internal:7100` |
 | `STATEMIG_APP_USER` | | | 앱 계정 이름 (기본 `app`). 원본 쓰기 차단에 씀 |

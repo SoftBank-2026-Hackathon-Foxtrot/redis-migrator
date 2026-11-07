@@ -523,12 +523,6 @@ func (s *session) run() {
 			return
 		}
 		name := string(bytes.ToLower(args[0]))
-		if p.allowedCommands != nil && !p.allowedCommands[name] {
-			s.flushBatch()
-			p.Stats.Denied.Add(1)
-			s.reply(redisx.ErrorReply("NOPERM command is outside the application command contract"))
-			continue
-		}
 		canBatch := s.authed && !s.inTx() && batchable(name, args)
 		if !canBatch {
 			s.flushBatch()
@@ -570,6 +564,14 @@ func (s *session) run() {
 				s.reply(redisx.ErrorReply("NOAUTH HELLO must be called with the client already authenticated"))
 				continue
 			}
+		}
+		// AUTH and QUIT are answered above and never reach a backend, so the contract only covers
+		// what is forwarded.
+		if p.allowedCommands != nil && !p.allowedCommands[name] {
+			s.flushBatch()
+			p.Stats.Denied.Add(1)
+			s.reply(redisx.ErrorReply("NOPERM command is outside the application command contract"))
+			continue
 		}
 		if why := s.role.deny(name, args, p.keys); why != "" {
 			s.flushBatch()

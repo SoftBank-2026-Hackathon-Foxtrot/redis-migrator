@@ -253,11 +253,14 @@ func (s *server) registerBackend(w http.ResponseWriter, r *http.Request) {
 		}
 		ct, kt, e := LoadCmdTable(c)
 		_ = c.Close()
-		if e == nil {
-			ct, kt, e = constrainCommands(ct, kt, s.proxy.allowedCommands)
-		}
 		if e != nil {
 			fail(w, fmt.Errorf("%w: backend command table unavailable", ErrState))
+			return
+		}
+		// With a contract only its commands are compared: another engine or version (Valkey,
+		// Memorystore, ElastiCache) has extra or missing commands the application never sends.
+		if ct, kt, e = constrainCommands(ct, kt, s.proxy.allowedCommands); e != nil {
+			fail(w, fmt.Errorf("%w: %v", ErrState, e))
 			return
 		}
 		if len(ct) != len(s.proxy.cmds) {
@@ -267,7 +270,7 @@ func (s *server) registerBackend(w http.ResponseWriter, r *http.Request) {
 		for command, held := range ct {
 			current, known := s.proxy.cmds[command]
 			if !known || current != held || s.proxy.keys[command] != kt[command] {
-				fail(w, fmt.Errorf("%w: incompatible backend command table", ErrState))
+				fail(w, fmt.Errorf("%w: incompatible backend command table: %s", ErrState, command))
 				return
 			}
 		}
