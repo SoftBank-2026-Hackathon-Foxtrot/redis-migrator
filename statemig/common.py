@@ -11,6 +11,7 @@ Plans, commands and retries are kept in a JSON file next to the control record, 
 for the management DB. quiesceRef is required but not verified: that needs the shared DB.
 """
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -20,12 +21,12 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Header, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-
-from .telemetry import get_telemetry
 from opentelemetry.trace import Status, StatusCode
+from pydantic import BaseModel, Field, model_validator
 
+from .bindings import BindingError, BindingReq, EndpointInput
 from .migration import ControlRecord, MigrationError, _why
+from .telemetry import get_telemetry
 
 log = logging.getLogger("statemig.common")
 
@@ -62,13 +63,26 @@ class Policy(BaseModel):
 class CreateReq(BaseModel):
     workflowId: str
     resourceId: str
-    kind: str
-    profile: str
-    sourceRef: str
-    targetRef: str
-    bindingRef: str
+    kind: str = "REDIS"
+    profile: str = PROFILE
+    sourceRef: str | None = None
+    targetRef: str | None = None
+    bindingRef: str | None = None
+    source: EndpointInput | None = None
+    target: EndpointInput | None = None
     workloadScopeRef: str
     policy: Policy = Policy()
+
+    @model_validator(mode="after")
+    def endpoints_present(self):
+        if self.source is not None or self.target is not None:
+            if self.source is None or self.target is None:
+                raise ValueError("source and target must be supplied together")
+            if self.sourceRef is not None or self.targetRef is not None:
+                raise ValueError("source/target objects cannot be mixed with sourceRef/targetRef")
+        elif not self.sourceRef or not self.targetRef:
+            raise ValueError("source and target are required")
+        return self
 
 
 class ActionReq(BaseModel):
@@ -113,9 +127,11 @@ class Store(ControlRecord):
 
 
 class CommonApi:
-    def __init__(self, proxy, sync, record, endpoints, store_path, get_current, new_core):
+    def __init__(self, proxy, sync, record, endpoints, store_path, get_current, new_core, bindings=None):
         self.proxy, self.sync, self.record, self.endpoints = proxy, sync, record, endpoints
         self.get_current, self.new_core = get_current, new_core
+        self.bindings = bindings
+        self.mutation_lock = asyncio.Lock()
         self.store = Store(store_path)
         self.data = self.store.load()
         self.tasks: set[asyncio.Task] = set()
@@ -157,25 +173,66 @@ class CommonApi:
                       "single node or primary/replica: cluster mode off", "keyspace notifications on (KEA)",
                       "maxmemory-policy noeviction when maxmemory is set",
                       f"registered resource: {', '.join(f'resource:{n}' for n in self.endpoints)}"]
-        return {"apiVersion": "v1", "profiles": [{
+        return {"apiVersion": "v1", "bindingRegistration": "/v1/bindings", "profiles": [{
             "kind": "REDIS", "profile": PROFILE, "sourceConditions": conditions, "targetConditions": conditions,
             "actions": ACTIONS, "rollbackModes": ["REVERSE_REQUIRED"],
-            "constraints": ["no Redis Cluster", "each db keeps its number; queues in db 0", "keyspace notifications required", "same engine family",
+            "actionSemantics": {"QUIESCE": "CHECKS_ONLY", "CUTOVER": "PAUSE_SWITCH_RESUME",
+                                "RESUME": "CONFIRM_LOCATION", "globalHoldOwner": "ORCHESTRATOR",
+                                "failureRollbackAcceptsDataLoss": True},
+            "constraints": ["no Redis Cluster", "each db keeps its number; queues in db 0", "keyspace notifications required", "same engine family", "database input must be string 0; all logical DBs keep their numbers",
                             "QUIESCE checks only; CUTOVER holds, switches and resumes writes in one command",
                             "ROLLBACK mode=failure accepts the loss of what the reverse sync had not copied"],
         }]}
 
+    def ensure_available(self):
+        for mig in self.data["migrations"].values():
+            if mig.get("unknownOperationId"):
+                raise Refused(409, "UNKNOWN_STATE", "reconcile the previous operation first")
+            if mig["lifecycle"] not in TERMINAL or mig.get("activeOperationId"):
+                raise Refused(409, "RESOURCE_BUSY", "the previous migration is unfinished")
+
+    async def create_plan(self, req: CreateReq) -> dict:
+        self.ensure_available()
+        if req.kind != "REDIS" or req.profile != PROFILE or req.policy.rollbackMode != "REVERSE_REQUIRED":
+            raise Refused(422, "UNSUPPORTED_PROFILE", f"supported: REDIS, {PROFILE}, REVERSE_REQUIRED")
+        if req.source is not None:
+            if not self.bindings:
+                raise Refused(422, "PRECONDITION_FAILED", "binding registration is unavailable")
+            binding = self.bindings.data["binding"]
+            if req.bindingRef and (not binding or req.bindingRef != binding["bindingRef"]):
+                raise Refused(422, "PRECONDITION_FAILED", "binding does not belong to this application")
+            try:
+                source, target, binding = await self.bindings.prepare(req.source, req.target, req.resourceId)
+            except BindingError as e:
+                raise Refused(e.status, e.code, str(e)) from None
+            req = req.model_copy(update={"sourceRef": source, "targetRef": target, "bindingRef": binding})
+        else:
+            req = req.model_copy(update={"bindingRef": req.bindingRef or BINDING})
+            px = (await self.proxy.call("GET", "/status"))["proxy"]
+            if px.get("paused") or px.get("active") != px.get("consume"):
+                raise Refused(409, "RESOURCE_BUSY", "proxy is paused or queue drain is unfinished")
+            if px.get("active") != self._endpoint(req.sourceRef):
+                raise Refused(409, "SOURCE_MISMATCH", "source is not the proxy's active Redis")
+        return self.create(req)
+
+    async def binding_view(self, binding_id: str) -> dict:
+        if not self.bindings:
+            raise BindingError("binding was not found", "NOT_FOUND", 404)
+        result = await self.bindings.view(binding_id)
+        migrations = [m for m in self.data["migrations"].values() if m["bindingRef"] == result["bindingRef"]]
+        result["lastMigrationId"] = migrations[-1]["migrationId"] if migrations else None
+        return result
+
     def create(self, req: CreateReq) -> dict:
         if req.kind != "REDIS" or req.profile != PROFILE or req.policy.rollbackMode != "REVERSE_REQUIRED":
             raise Refused(422, "UNSUPPORTED_PROFILE", f"supported: REDIS, {PROFILE}, REVERSE_REQUIRED")
-        if req.bindingRef != BINDING:
+        binding = self.bindings.data["binding"] if self.bindings else None
+        if req.bindingRef not in (BINDING, binding["bindingRef"] if binding else None):
             raise Refused(422, "PRECONDITION_FAILED", f"unknown binding {req.bindingRef}")
         source, target = self._endpoint(req.sourceRef), self._endpoint(req.targetRef)
         if source == target:
             raise Refused(422, "PRECONDITION_FAILED", "source and target are the same resource")
-        for m in self.data["migrations"].values():
-            if m["lifecycle"] not in TERMINAL:      # a single proxy: one change at a time
-                raise Refused(409, "RESOURCE_BUSY", f"{m['migrationId']} is {m['lifecycle']}")
+        self.ensure_available()
         migration_id = f"mig-{uuid.uuid4().hex[:12]}"
         self.data["migrations"][migration_id] = {
             **req.model_dump(), "migrationId": migration_id, "source": source, "target": target, "revision": 1,
@@ -193,6 +250,8 @@ class CommonApi:
         return ALLOWED[lifecycle]
 
     def _check_action(self, mig: dict, req: ActionReq):
+        if mig["lifecycle"] in TERMINAL:
+            raise Refused(409, "INVALID_STATE", "completed migration history cannot be changed")
         if req.action not in ACTIONS:
             raise Refused(400, "INVALID_REQUEST", f"unknown action {req.action}")
         if mig["activeOperationId"]:
@@ -266,6 +325,8 @@ class CommonApi:
         op["confirmedChanges"] = _changes(req.action, op, before, await self._observe(mig))
         mig["activeOperationId"] = None
         mig["revision"] += 1
+        if mig["lifecycle"] in TERMINAL and not mig.get("unknownOperationId"):
+            await self.view(mig["migrationId"])
         self.store.save(self.data)
 
     @staticmethod
@@ -321,11 +382,13 @@ class CommonApi:
             mig["lifecycle"] = "ACTIVE"
         else:
             mig["lifecycle"], mig["transitionState"] = "RESTORED", "CLOSED"
+            mig["rolledBack"] = True
         return {"location": req.expectedLocation, "alreadyResumed": True}
 
     async def _do_rollback(self, mig: dict, req: ActionReq) -> dict:
         res = await self._core(mig).rollback(req.mode, self._budget_ms(mig))
         mig["cutOver"], mig["returning"] = False, False
+        mig["rolledBack"] = True
         mig["lifecycle"] = "ROLLED_BACK_HELD"
         return res
 
@@ -339,6 +402,11 @@ class CommonApi:
         return {"targetDataKept": True}
 
     async def _do_finalize(self, mig: dict, req: ActionReq) -> dict:
+        if self.bindings and self.bindings.data["binding"]:
+            try:
+                await self.bindings.stable_route()
+            except BindingError as e:
+                raise Refused(e.status, e.code, str(e)) from None
         core = self._core(mig)
         if mig["lifecycle"] == "ACTIVE":
             await core.commit()
@@ -406,7 +474,10 @@ class CommonApi:
         names = {mig["source"]: "SOURCE", mig["target"]: "TARGET"}
         consumer = names.get(px.get("consume"), "UNKNOWN")
         route = observed["route"]
-        if not mig["cutOver"] and route == "SOURCE":
+        returned = mig.get("rolledBack") or mig["lifecycle"] in ("ROLLED_BACK_HELD", "RESTORED")
+        if returned and route == "SOURCE":
+            drain = "SUCCEEDED" if consumer == "SOURCE" else "RUNNING" if consumer == "TARGET" else "UNKNOWN"
+        elif not mig["cutOver"] and route == "SOURCE":
             drain = "NOT_STARTED"
         elif consumer == route and route != "UNKNOWN":
             drain = "SUCCEEDED"
@@ -415,7 +486,8 @@ class CommonApi:
         else:
             drain = "RUNNING"
         return {"dataRoute": route, "producerRoute": route, "consumerRoute": consumer,
-                "sourceConsumerAccess": _source_consumer_access(drain), "drainStatus": drain}
+                "sourceConsumerAccess": "ALLOWED" if route == "SOURCE" else _source_consumer_access(drain),
+                "drainStatus": drain}
 
     def _check(self, mig: dict, code: str, stage: str, decision: dict, observed: dict) -> dict:
         at = observed["observedAt"]
@@ -434,6 +506,9 @@ class CommonApi:
 
     async def view(self, migration_id: str) -> dict:
         mig = self._mig(migration_id)
+        if (mig["lifecycle"] in TERMINAL and mig.get("terminalView")
+                and not mig.get("unknownOperationId") and not mig.get("activeOperationId")):
+            return copy.deepcopy(mig["terminalView"])
         core = self._core(mig)
         observed = await self._observe(mig)
         why_not_ready = None
@@ -506,10 +581,10 @@ class CommonApi:
 
         method = "REVERSE_SYNC" if rollback["result"] == "PASS" else "DIRECT" if not mig["targetWritesPossible"] else "UNAVAILABLE"
         health = "UNKNOWN" if mig["unknownOperationId"] or route == "UNKNOWN" else "FAILED" if lifecycle == "FAILED" else "OK"
-        allowed = ([] if mig["activeOperationId"] else ["RECONCILE"] if mig["unknownOperationId"]
-                   else self._allowed(mig, lifecycle) + ["RECONCILE"])
+        allowed = ([] if mig["activeOperationId"] or mig["lifecycle"] in TERMINAL
+                   else ["RECONCILE"] if mig["unknownOperationId"] else self._allowed(mig, lifecycle) + ["RECONCILE"])
         public_observed = {k: v for k, v in observed.items() if k != "proxy"}
-        return {
+        result = {
             "migrationId": mig["migrationId"], "workflowId": mig["workflowId"], "resourceId": mig["resourceId"],
             "kind": mig["kind"], "revision": mig["revision"], "lifecycle": lifecycle,
             "health": health, "phase": f"redis.{core.state.lower()}" if core else "redis.none",
@@ -522,6 +597,10 @@ class CommonApi:
             "checks": checks,
             "details": {"redis": details},
         }
+        if mig["lifecycle"] in TERMINAL and not mig["activeOperationId"] and not mig.get("unknownOperationId"):
+            mig["terminalView"] = copy.deepcopy(result)
+            self.store.save(self.data)
+        return result
 
     def tick(self):
         """Once a second: how long has the active route been up without a change?"""
@@ -590,20 +669,49 @@ def build_router(api: CommonApi) -> APIRouter:
     async def capabilities():
         return api.capabilities()
 
+    @router.post("/bindings", status_code=201)
+    async def create_binding(req: BindingReq, idempotency_key: str | None = Header(None)):
+        body = req.model_dump(exclude_none=True)
+        async with api.mutation_lock:
+            try:
+                record_key, replayed = api.replay("POST /v1/bindings", idempotency_key, body)
+                if replayed:
+                    return replayed
+                api.ensure_available()
+                if not api.bindings:
+                    raise Refused(422, "PRECONDITION_FAILED", "binding registration is unavailable")
+                payload = await api.bindings.create(req, record_key)
+                payload["lastMigrationId"] = None
+                headers = {"Location": f"/v1/bindings/{payload['bindingId']}"}
+                api.remember(record_key, body, 201, payload, headers)
+                return JSONResponse(payload, status_code=201, headers=headers)
+            except BindingError as e:
+                return _error(Refused(e.status, e.code, str(e)))
+            except Refused as e:
+                return _error(e)
+
+    @router.get("/bindings/{binding_id}")
+    async def binding_status(binding_id: str):
+        try:
+            return await api.binding_view(binding_id)
+        except BindingError as e:
+            return _error(Refused(e.status, e.code, str(e)))
+
     @router.post("/migrations", status_code=201)
     async def create(req: CreateReq, idempotency_key: str | None = Header(None)):
         body = req.model_dump()
-        try:
-            record_key, replayed = api.replay("POST /v1/migrations", idempotency_key, body)
-            if replayed:
-                return replayed
-            mig = api.create(req)
-        except Refused as e:
-            return _error(e)
-        payload = await api.view(mig["migrationId"])
-        headers = {"Location": f"/v1/migrations/{mig['migrationId']}"}
-        api.remember(record_key, body, 201, payload, headers)
-        return JSONResponse(payload, status_code=201, headers=headers)
+        async with api.mutation_lock:
+            try:
+                record_key, replayed = api.replay("POST /v1/migrations", idempotency_key, body)
+                if replayed:
+                    return replayed
+                mig = await api.create_plan(req)
+            except Refused as e:
+                return _error(e)
+            payload = await api.view(mig["migrationId"])
+            headers = {"Location": f"/v1/migrations/{mig['migrationId']}"}
+            api.remember(record_key, body, 201, payload, headers)
+            return JSONResponse(payload, status_code=201, headers=headers)
 
     @router.get("/migrations/{migration_id}")
     async def status(migration_id: str):

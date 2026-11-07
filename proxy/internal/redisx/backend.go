@@ -50,6 +50,31 @@ func ParseEndpoints(spec string) (map[string]*Endpoint, []string, error) {
 	return eps, order, nil
 }
 
+// ParseEndpoint parses API input without including credentials in errors.
+func ParseEndpoint(name, raw string) (*Endpoint, error) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "redis" && u.Scheme != "rediss") || u.Hostname() == "" {
+		return nil, fmt.Errorf("invalid Redis endpoint")
+	}
+	port := u.Port()
+	if port == "" {
+		port = "6379"
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return nil, fmt.Errorf("invalid Redis port")
+	}
+	ep := &Endpoint{Name: name, Addr: net.JoinHostPort(u.Hostname(), port), TLS: u.Scheme == "rediss"}
+	if u.User != nil {
+		ep.username = u.User.Username()
+		ep.password, _ = u.User.Password()
+	}
+	return ep, nil
+}
+
+// Same compares credentials without exposing them in the API.
+func (e *Endpoint) Same(other *Endpoint) bool { return other != nil && *e == *other }
+
 // ClientName is set with CLIENT SETNAME on every connection this process dials. It tells the
 // migration's own connections from an application's direct ones in CLIENT LIST, which is how the
 // precheck proves that every application goes through the proxy. Set it once, before dialling.

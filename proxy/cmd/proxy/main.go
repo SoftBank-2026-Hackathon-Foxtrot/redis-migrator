@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"statemig/internal/redisx"
@@ -40,7 +41,10 @@ type controlRecord struct {
 }
 
 type server struct {
+	mu          sync.Mutex
+	pointerMu   sync.RWMutex
 	proxy       *Proxy
+	clients     map[string]Client
 	endpoints   map[string]*redisx.Endpoint
 	order       []string
 	controlFile string
@@ -90,7 +94,12 @@ func (s *server) routeOf(rec *controlRecord) (Route, error) {
 
 func main() {
 	redisx.ClientName = "statemig-proxy"
-	eps, order, err := redisx.ParseEndpoints(env("STATEMIG_ENDPOINTS", "local=redis://localhost:6379"))
+	eps := map[string]*redisx.Endpoint{}
+	var order []string
+	var err error
+	if spec := os.Getenv("STATEMIG_ENDPOINTS"); spec != "" {
+		eps, order, err = redisx.ParseEndpoints(spec)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -103,46 +112,49 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	s.clients = clients
 
-	rec, err := readRecord(s.controlFile)
-	if err != nil {
-		name := env("STATEMIG_ACTIVE", order[0])
-		rec = &controlRecord{Active: name, Consume: name}
-		log.Printf("no control record (%v): starting on %s", err, name)
-	}
-	route, err := s.routeOf(rec)
-	if err != nil {
-		log.Fatal(err)
-	}
+	if len(order) > 0 {
+		rec, err := readRecord(s.controlFile)
+		if err != nil {
+			name := env("STATEMIG_ACTIVE", order[0])
+			rec = &controlRecord{Active: name, Consume: name}
+			log.Printf("no control record (%v): starting on %s", err, name)
+		}
+		route, err := s.routeOf(rec)
+		if err == nil {
 
-	backends := []*redisx.Endpoint{route.Active}
-	for _, n := range order {
-		if eps[n] != route.Active {
-			backends = append(backends, eps[n])
+			backends := []*redisx.Endpoint{route.Active}
+			for _, n := range order {
+				if eps[n] != route.Active {
+					backends = append(backends, eps[n])
+				}
+			}
+			var p *Proxy
+			for i := 0; ; i++ { // backends may still be starting
+				if p, err = NewProxy(route, rec.Paused, clients, backends); err == nil {
+					break
+				}
+				if i == 30 {
+					log.Fatal(err)
+				}
+				time.Sleep(time.Second)
+			}
+			s.proxy = p
 		}
 	}
-	var p *Proxy
-	for i := 0; ; i++ { // backends may still be starting
-		if p, err = NewProxy(route, rec.Paused, clients, backends); err == nil {
-			break
-		}
-		if i == 30 {
-			log.Fatal(err)
-		}
-		time.Sleep(time.Second)
-	}
-	s.proxy = p
 
 	ln, err := net.Listen("tcp", env("STATEMIG_LISTEN", ":6379"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("RESP proxy on %s gen=%d active=%s consume=%s paused=%v", ln.Addr(), route.Gen, route.Active.Name,
-		route.Consume.Name, rec.Paused)
-	go func() { log.Fatal(p.Serve(ln)) }()
+	log.Printf("fixed RESP proxy on %s", ln.Addr())
+	go func() { log.Fatal(s.serve(ln)) }()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", s.status)
+	mux.HandleFunc("POST /backends", s.registerBackend)
+	mux.HandleFunc("POST /bind", s.bind)
 	mux.HandleFunc("POST /pause", s.pause)
 	mux.HandleFunc("POST /switch", s.switchRoute)
 	mux.HandleFunc("POST /resume", s.resume)
@@ -150,7 +162,16 @@ func main() {
 	mux.HandleFunc("POST /drain-done", s.drainDone)
 	addr := env("STATEMIG_ADMIN", ":7000")
 	log.Printf("admin API on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, redisx.RequireToken(token, mux)))
+	admin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.proxy == nil && r.URL.Path != "/status" && r.URL.Path != "/backends" && r.URL.Path != "/bind" {
+			fail(w, fmt.Errorf("%w: proxy is not bound", ErrState))
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	log.Fatal(http.ListenAndServe(addr, redisx.RequireToken(token, admin)))
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -172,7 +193,116 @@ func (s *server) status(w http.ResponseWriter, _ *http.Request) {
 	for _, n := range s.order {
 		eps = append(eps, s.endpoints[n])
 	}
-	writeJSON(w, 200, map[string]any{"proxy": s.proxy.Status(), "endpoints": eps})
+	var state any = map[string]any{"bound": false, "active": "", "consume": "", "gen": 0, "paused": false}
+	if s.proxy != nil {
+		state = s.proxy.Status()
+	}
+	writeJSON(w, 200, map[string]any{"proxy": state, "endpoints": eps})
+}
+
+func (s *server) serve(ln net.Listener) error {
+	for {
+		nc, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		s.pointerMu.RLock()
+		p := s.proxy
+		s.pointerMu.RUnlock()
+		if p == nil {
+			_, _ = nc.Write([]byte("-LOADING Redis binding is not ready\r\n"))
+			_ = nc.Close()
+			continue
+		}
+		p.ServeConn(nc)
+	}
+}
+
+// Registering a backend never switches or pauses the active route. Resolved secrets stay in memory.
+func (s *server) registerBackend(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req) != nil || req.Name == "" || strings.ContainsAny(req.Name, "=,\r\n") {
+		fail(w, fmt.Errorf("%w: name and Redis connection required", ErrState))
+		return
+	}
+	ep, err := redisx.ParseEndpoint(req.Name, req.URL)
+	if err != nil {
+		fail(w, fmt.Errorf("%w: invalid Redis endpoint", ErrState))
+		return
+	}
+	old := s.endpoints[req.Name]
+	if old != nil && old.Same(ep) {
+		writeJSON(w, 200, old)
+		return
+	}
+	if s.proxy != nil {
+		route, paused := s.proxy.Route()
+		if paused || route.Active.Name != route.Consume.Name || (old != nil && (route.Active.Name == req.Name || route.Consume.Name == req.Name)) {
+			fail(w, fmt.Errorf("%w: active or unfinished route cannot be replaced", ErrState))
+			return
+		}
+		c, e := ep.DialWithin(0, 3*time.Second)
+		if e != nil {
+			fail(w, fmt.Errorf("%w: backend connection failed", ErrState))
+			return
+		}
+		ct, kt, e := LoadCmdTable(c)
+		_ = c.Close()
+		if e != nil {
+			fail(w, fmt.Errorf("%w: backend command table unavailable", ErrState))
+			return
+		}
+		if len(ct) != len(s.proxy.cmds) {
+			fail(w, fmt.Errorf("%w: incompatible backend command set", ErrState))
+			return
+		}
+		for command, held := range ct {
+			current, known := s.proxy.cmds[command]
+			if !known || current != held || s.proxy.keys[command] != kt[command] {
+				fail(w, fmt.Errorf("%w: incompatible backend command table", ErrState))
+				return
+			}
+		}
+	}
+	if old == nil {
+		s.order = append(s.order, req.Name)
+	}
+	s.endpoints[req.Name] = ep
+	writeJSON(w, 201, ep)
+}
+
+// The API restores endpoint credentials first. The durable control record chooses the route.
+func (s *server) bind(w http.ResponseWriter, _ *http.Request) {
+	if s.proxy != nil {
+		writeJSON(w, 200, s.proxy.Status())
+		return
+	}
+	rec, err := readRecord(s.controlFile)
+	if err != nil {
+		fail(w, fmt.Errorf("%w: control record unavailable", ErrState))
+		return
+	}
+	route, err := s.routeOf(rec)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	backends := []*redisx.Endpoint{route.Active}
+	if route.Consume != route.Active {
+		backends = append(backends, route.Consume)
+	}
+	p, err := NewProxy(route, rec.Paused, s.clients, backends)
+	if err != nil {
+		fail(w, fmt.Errorf("%w: backend initialization failed", ErrState))
+		return
+	}
+	s.pointerMu.Lock()
+	s.proxy = p
+	s.pointerMu.Unlock()
+	writeJSON(w, 200, p.Status())
 }
 
 type genReq struct {

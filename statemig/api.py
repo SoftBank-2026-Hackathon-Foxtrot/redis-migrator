@@ -23,17 +23,18 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .telemetry import TraceMiddleware, get_telemetry, publish_loop
 from .backend import Endpoint
+from .bindings import Bindings
 from .common import CommonApi, build_router
 from .migration import Admin, ControlRecord, Migration, MigrationError, MigrationStore
+from .telemetry import TraceMiddleware, get_telemetry, publish_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
 ENDPOINTS = {
     name: Endpoint(name, url)
     for name, url in (item.split("=", 1) for item in os.environ.get(
-        "STATEMIG_ENDPOINTS", "local=redis://localhost:6379").split(","))
+        "STATEMIG_ENDPOINTS", "").split(",") if item)
 }
 TOKEN = os.environ["STATEMIG_ADMIN_TOKEN"]
 proxy = Admin(os.environ.get("STATEMIG_PROXY", "http://localhost:7000"), TOKEN)
@@ -46,6 +47,7 @@ if DIRECT_USER == APP_USER:
     raise RuntimeError("STATEMIG_DIRECT_USER must differ from STATEMIG_APP_USER: shutting it would cut the proxy off")
 current: Migration | None = None
 history: list[dict] = []
+bindings = Bindings(str(record.path.with_name("bindings.json")), proxy, sync, record, ENDPOINTS)
 
 
 def require_token(authorization: str = Header("")):
@@ -73,7 +75,16 @@ async def invalid_request(request: Request, exc: RequestValidationError):
 @app.on_event("startup")
 async def recover_saved_migration():
     global current
-    current = Migration.load(proxy, sync, record, store, ENDPOINTS, APP_USER, DIRECT_USER)
+    try:
+        await _restore_binding(recover_new=False)
+        core_id = common.data.get("core")
+        terminal = core_id and common.data["migrations"][core_id]["lifecycle"] in ("COMPLETED", "CANCELLED")
+        if not terminal and current is None:
+            current = Migration.load(proxy, sync, record, store, ENDPOINTS, APP_USER, DIRECT_USER)
+            if current:
+                current.persistent_proxy = bool(bindings.data["binding"])
+    except Exception:
+        logging.getLogger("statemig.api").error("binding recovery is not confirmed; new migrations remain blocked")
     if current:
         asyncio.create_task(current.recover())
     app.state.watch_task = asyncio.create_task(_watch())
@@ -105,10 +116,27 @@ async def _watch():
         await asyncio.sleep(1)
         common.tick()
         try:
+            await _restore_binding()
             if current:
                 await current.watch_once()
         except Exception:  # noqa: BLE001  the next round tries again
             logging.getLogger("statemig.api").exception("watch")
+
+
+async def _restore_binding(recover_new=True):
+    global current
+    if not bindings.data["binding"]:
+        return
+    core_id = common.data.get("core")
+    unfinished = core_id and common.data["migrations"][core_id]["lifecycle"] not in ("COMPLETED", "CANCELLED")
+    saved = store.read() if unfinished else None
+    required = (saved["source"], saved["target"]) if saved else ()
+    await bindings.restore(required)
+    if saved and current is None:
+        current = Migration.load(proxy, sync, record, store, ENDPOINTS, APP_USER, DIRECT_USER)
+        current.persistent_proxy = True
+        if recover_new:
+            asyncio.create_task(current.recover())
 
 
 class StartReq(BaseModel):
@@ -153,6 +181,8 @@ async def _new_migration(req: StartReq) -> Migration:
     if req.target not in ENDPOINTS:
         raise HTTPException(400, f"unknown endpoint {req.target}")
     px = (await proxy.call("GET", "/status"))["proxy"]
+    if px.get("paused"):
+        raise HTTPException(409, "proxy is paused")
     if req.target == px["active"]:
         raise HTTPException(400, "target is already active")
     if px["active"] != px["consume"]:
@@ -168,7 +198,7 @@ async def _new_migration(req: StartReq) -> Migration:
         history.append(current.status())
         current.retire()
     current = Migration(proxy, sync, record, ENDPOINTS[px["active"]], ENDPOINTS[req.target], APP_USER, store, req.mode,
-                        DIRECT_USER)
+                        DIRECT_USER, persistent_proxy=bool(bindings.data["binding"]))
     return current
 
 
@@ -208,7 +238,8 @@ async def _new_core(target: str, budget_ms: int) -> Migration:
         raise MigrationError(str(e.detail)) from e
 
 
-common = CommonApi(proxy, sync, record, ENDPOINTS, str(record.path.with_name("common.json")), lambda: current, _new_core)
+common = CommonApi(proxy, sync, record, ENDPOINTS, str(record.path.with_name("common.json")), lambda: current, _new_core,
+                   bindings=bindings)
 app.include_router(build_router(common))
 
 
