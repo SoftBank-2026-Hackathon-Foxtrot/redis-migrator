@@ -1,0 +1,24 @@
+{
+  "family": "foxtrot-redis-migration",
+  "region": "ap-northeast-2",
+  "cluster": "foxtrot-management",
+  "serviceName": "redis-migration",
+  "goImage": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/statemig-go:REPLACE-IMMUTABLE-TAG",
+  "apiImage": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/statemig:REPLACE-IMMUTABLE-TAG",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/foxtrot-redis-execution",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/foxtrot-redis-task",
+  "logGroup": "/foxtrot/redis-migration",
+  "fileSystemId": "fs-0123456789abcdef0",
+  "accessPointId": "fsap-0123456789abcdef0",
+  "initialBackend": "aws",
+  "appUser": "app",
+  "subnetIds": ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"],
+  "securityGroupIds": ["sg-0123456789abcdef0"],
+  "serviceRegistryArn": "arn:aws:servicediscovery:ap-northeast-2:123456789012:service/srv-REPLACE",
+  "secrets": {
+    "proxyEndpoints": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:redis-proxy-endpoints-REPLACE",
+    "adminEndpoints": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:redis-admin-endpoints-REPLACE",
+    "adminToken": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:redis-admin-token-REPLACE",
+    "clients": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:redis-clients-REPLACE"
+  }
+}
