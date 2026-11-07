@@ -238,3 +238,7 @@ ElastiCache for Valkey 8.0, Memorystore for Redis 7.2, 온프레 Valkey 8.0을 T
 - `e90b7e1`, `cc948e0`의 실환경 재측정
 
 구현이 설계와 다른 점은 [DESIGN.md](DESIGN.md), 온프레 구성은 [onprem/README.md](onprem/README.md)에 있다.
+
+## 마이그레이션 관측
+
+추가 필드와 연결 방법은 [관측 연결](docs/migration-observability.md)을 참고하세요.

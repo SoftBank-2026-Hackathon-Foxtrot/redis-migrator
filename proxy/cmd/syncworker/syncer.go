@@ -70,6 +70,8 @@ type shard struct {
 }
 
 type Syncer struct {
+	observationEpoch string // distinguishes counters after a worker restart
+
 	include []string
 
 	mu       sync.Mutex
@@ -127,6 +129,7 @@ func NewSyncer(src, dst *redisx.Endpoint, include []string, workers int) *Syncer
 	s.lastErr.Store("")
 	s.halted.Store("")
 	s.comparedResync.Store(-1)
+	s.observationEpoch = time.Now().UTC().Format(time.RFC3339Nano)
 	s.lastCompare.Store(map[string]any{})
 	for i := 0; i < workers; i++ {
 		sh := &shard{dirty: map[string]int64{}}
@@ -763,7 +766,7 @@ func (s *Syncer) Status() map[string]any {
 		mode = "logical"
 	}
 	return map[string]any{
-		"src": src.Name, "dst": dst.Name, "include": s.include, "subscribed": s.subscribed.Load(),
+		"src": src.Name, "dst": dst.Name, "epoch": s.observationEpoch, "include": s.include, "subscribed": s.subscribed.Load(),
 		"backlog": n, "oldest_dirty_age_ms": age, "copy_mode": mode,
 		"copied": s.copied.Load(), "deleted": s.deleted.Load(), "errors": s.errs.Load(),
 		"marked": s.marked.Load(), "notifications": s.notifications.Load(), "resyncs": s.resyncs.Load(),
@@ -1139,6 +1142,7 @@ func (s *Syncer) precompareLocked(deadline time.Time, byValue bool) (map[string]
 	if err != nil {
 		return nil, err
 	}
+	res["observed_at"] = time.Now().UTC().Format(time.RFC3339Nano)
 	s.lastCompare.Store(res)
 	if s.resyncs.Load() != base {
 		return res, errors.New("precompare: subscription dropped during the pass")

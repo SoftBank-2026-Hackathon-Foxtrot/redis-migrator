@@ -22,6 +22,9 @@ from fastapi import APIRouter, Header, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .telemetry import get_telemetry
+from opentelemetry.trace import Status, StatusCode
+
 from .migration import ControlRecord, MigrationError, _why
 
 log = logging.getLogger("statemig.common")
@@ -232,7 +235,20 @@ class CommonApi:
         return op
 
     async def _execute(self, mig: dict, op: dict, req: ActionReq):
+        telemetry = get_telemetry("redis")
+        with telemetry.operation(req.action, workflow=mig["workflowId"],
+                                 migration=mig["migrationId"], operation=op["operationId"]) as span:
+            await self._execute_work(mig, op, req)
+            if op["status"] != "SUCCEEDED":
+                span.set_status(Status(StatusCode.ERROR, op["status"]))
+            try:
+                telemetry.snapshot("REDIS", await self.view(mig["migrationId"]))
+            except Exception:
+                log.warning("operation observation unavailable")
+
+    async def _execute_work(self, mig: dict, op: dict, req: ActionReq):
         op["status"] = "RUNNING"
+        op["startedAt"] = _now()
         self.store.save(self.data)
         before = await self._observe(mig)
         try:
@@ -246,6 +262,7 @@ class CommonApi:
             log.exception("%s", req.action)
             op["status"], op["error"] = "UNKNOWN", self._op_error(op, "UNKNOWN_STATE", _why(e))
             mig["unknownOperationId"] = op["operationId"]
+        op["finishedAt"] = _now()
         op["confirmedChanges"] = _changes(req.action, op, before, await self._observe(mig))
         mig["activeOperationId"] = None
         mig["revision"] += 1
@@ -427,6 +444,12 @@ class CommonApi:
             mig["isReady"] = core.state == "SYNCING" and not why_not_ready
         lifecycle = self._lifecycle(mig)
         details = self._details(mig, observed, core)
+        details["sync"] = sync_view
+        px = observed.get("proxy") or {}
+        details["proxy"] = {key: px.get(key) for key in (
+            "gen", "paused", "inflight_writes", "open_tx", "last_pause_ms",
+            "pubsub_sessions", "pubsub_moved", "pubsub_cut", "pubsub_dropped")}
+        details["proxy"]["observedAt"] = observed["observedAt"] if px else None
         route, paused = observed["route"], (observed.get("proxy") or {}).get("paused")
 
         if lifecycle in ("READY", "QUIESCED"):
