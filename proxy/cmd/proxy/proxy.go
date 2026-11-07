@@ -21,6 +21,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,9 +53,10 @@ type Client struct {
 }
 
 type Proxy struct {
-	clients map[string]Client // empty: no auth, no role limits
-	cmds    CmdTable
-	keys    KeyTable
+	clients         map[string]Client // empty: no auth, no role limits
+	cmds            CmdTable
+	keys            KeyTable
+	allowedCommands map[string]bool
 
 	mu       sync.Mutex
 	cond     *sync.Cond
@@ -122,9 +124,24 @@ func NewProxy(route Route, paused bool, clients map[string]Client, backends []*r
 	if err != nil {
 		return nil, err
 	}
+	var allowed map[string]bool
+	if raw := strings.TrimSpace(os.Getenv("STATEMIG_ALLOWED_COMMANDS")); raw != "" {
+		allowed = map[string]bool{}
+		for _, command := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' || r == '\n' }) {
+			allowed[strings.ToLower(command)] = true
+		}
+		if len(allowed) == 0 {
+			return nil, fmt.Errorf("application command contract is empty")
+		}
+		ct, kt, err = constrainCommands(ct, kt, allowed)
+		if err != nil {
+			return nil, err
+		}
+	}
 	p := &Proxy{clients: clients, cmds: ct, keys: kt, route: route, paused: paused, sessions: map[*session]struct{}{},
-		pendingCache: map[string]int{},
-		latency:      newLatencyWindow(20000), blockCap: 200, upstreamTimeout: 3 * time.Second}
+		allowedCommands: allowed,
+		pendingCache:    map[string]int{},
+		latency:         newLatencyWindow(20000), blockCap: 200, upstreamTimeout: 3 * time.Second}
 	if paused {
 		p.pausedAt = time.Now()
 	}
@@ -506,6 +523,12 @@ func (s *session) run() {
 			return
 		}
 		name := string(bytes.ToLower(args[0]))
+		if p.allowedCommands != nil && !p.allowedCommands[name] {
+			s.flushBatch()
+			p.Stats.Denied.Add(1)
+			s.reply(redisx.ErrorReply("NOPERM command is outside the application command contract"))
+			continue
+		}
 		canBatch := s.authed && !s.inTx() && batchable(name, args)
 		if !canBatch {
 			s.flushBatch()

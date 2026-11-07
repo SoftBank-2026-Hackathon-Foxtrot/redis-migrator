@@ -13,6 +13,8 @@ package main
 //   STATEMIG_CLIENTS        accounts clients AUTH with: app:pw:app,worker:pw:worker
 //                           (user:password:role); empty means no auth and no role limits
 //   STATEMIG_ADMIN_TOKEN    bearer token required on the admin API
+//   STATEMIG_ALLOWED_COMMANDS optional comma-separated application command contract;
+//                            omitted commands are rejected, provider extras are ignored
 //
 // The control plane writes the record first and then calls the admin API; the
 // proxy only accepts a switch to the generation that is in the record. On
@@ -251,6 +253,9 @@ func (s *server) registerBackend(w http.ResponseWriter, r *http.Request) {
 		}
 		ct, kt, e := LoadCmdTable(c)
 		_ = c.Close()
+		if e == nil {
+			ct, kt, e = constrainCommands(ct, kt, s.proxy.allowedCommands)
+		}
 		if e != nil {
 			fail(w, fmt.Errorf("%w: backend command table unavailable", ErrState))
 			return
